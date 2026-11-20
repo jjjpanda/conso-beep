@@ -9,7 +9,7 @@
   --avoid-speech record SECONDS (default 1.5) of mic audio, use quietest region as root
   --mic          record SECONDS (default 2) of mic audio, auto-detect music vs talking
                  (by key-detection confidence) and pick --auto-key or --avoid-speech behavior
-  --hook         read Claude Code or Antigravity hook JSON from stdin, trigger matching
+  --hook         read LLM harness hook JSON from stdin, trigger matching
                  melody, and emit hook JSON to stdout
   --sync         play audio synchronously in --hook mode instead of spawning detached
 
