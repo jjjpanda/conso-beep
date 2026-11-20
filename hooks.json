@@ -1,0 +1,30 @@
+{
+  "conso-beep": {
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "python beep.py --hook --mic",
+        "timeout": 10
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python beep.py --hook --mic",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "python beep.py --hook --mic",
+        "timeout": 10
+      }
+    ]
+  }
+}

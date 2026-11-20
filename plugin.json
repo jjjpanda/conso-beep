@@ -1,0 +1,6 @@
+{
+  "name": "conso-beep",
+  "displayName": "Conso Beep",
+  "version": "1.0.0",
+  "description": "Ambient-aware audio tones for agent lifecycle hooks."
+}
