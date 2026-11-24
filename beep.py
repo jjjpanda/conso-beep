@@ -1,25 +1,31 @@
 #!/usr/bin/env python3
-"""Usage: beep.py [--root HZ|NOTE | --auto-key [SECONDS] | --avoid-speech [SECONDS] | --mic [SECONDS]] [--hook [--sync]] [-- semitones,vol,ms ...]
-  semitones: signed offset from root (0 = root note)
+"""Usage: beep.py [--root HZ|NOTE | --auto-key [SECONDS] | --avoid-speech [SECONDS] | --mic [SECONDS]] [--pan PAN] [--muffle MUFFLE] [--ticks N] [--verbose] [--hook [--sync]] [-- semitones,vol,ms ...]
+  semitones: signed offset from root (0 = root note), -48 to 48
   vol:       0.0-1.0
-  ms:        duration in milliseconds
+  ms:        duration in milliseconds, 0-10000
 
-  --root         Hz number (523.25) or note name (C5, F#4, Bb3). Default: 440 (A4).
+  --root         Hz number (523.25) or note name (C5, F#4, Bb3). Default: 440 (A4). Max 20000.
   --auto-key     record SECONDS (default 2) of mic audio, use detected key's tonic as root
   --avoid-speech record SECONDS (default 1.5) of mic audio, use quietest region as root
   --mic          record SECONDS (default 2) of mic audio, auto-detect music vs talking
                  (by key-detection confidence) and pick --auto-key or --avoid-speech behavior
+  --pan          stereo pan from -1.0 (left) to 1.0 (right); overrides Windows detection
+  --muffle       muffle amount from 0.0 (clear) to 1.0 (behind a wall); overrides Windows detection
+  --ticks        0-3 clicks before the melody (virtual-desktop distance); overrides Windows detection
+  --verbose      log resolved spatial settings to stderr
   --hook         read LLM harness hook JSON from stdin, trigger matching
                  melody, and emit hook JSON to stdout
   --sync         play audio synchronously in --hook mode instead of spawning detached
 
-All output is octave-folded to stay at or below 800 Hz.
+Melody fundamentals are octave-folded to stay at or below 800 Hz (ticks and muffle
+overtones are higher). Mic recording is capped at 30 seconds.
 
 Note: positional notes must follow a `--` separator (negative offsets look like
 flags to argparse otherwise), e.g. beep.py --root 440 -- -3,0.7,90
 """
 import argparse
 import json
+import math
 import pathlib
 import re
 import subprocess
@@ -30,12 +36,21 @@ GAP_MS = 12
 TAIL_MS = 150
 DECAY_RATE = 5
 ATTACK_S = 0.004
+MUFFLE_HARMONICS = (1.0, 0.3, 0.15, 0.08)
+CLICK_HZ = 2200.0
+CLICK_VOL = 0.5
+CLICK_MS = 8
+CLICK_GAP_MS = 85
+CLICK_LEAD_MS = 60
 
 DEFAULT_ROOT_HZ = 440.0
 DEFAULT_AUTO_KEY_SECONDS = 2.0
 DEFAULT_AVOID_SPEECH_SECONDS = 1.5
 DEFAULT_MIC_SECONDS = 2.0
 MAX_HZ = 800.0
+MAX_ROOT_HZ = 20000.0
+MAX_RECORD_SECONDS = 30.0
+NOTE_LIMITS = ((-48.0, 48.0, "semitones"), (0.0, 1.0, "vol"), (0.0, 10000.0, "ms"))
 MUSIC_CONFIDENCE_THRESHOLD = 0.55
 CHROMA_FMIN, CHROMA_FMAX = 65.0, 2100.0
 QUIET_BAND = (200.0, 4000.0)
@@ -85,15 +100,17 @@ def parse_note_name(name):
 
 def parse_root(root_arg):
     try:
-        return float(root_arg)
+        hz = float(root_arg)
     except ValueError:
-        pass
-    try:
-        return parse_note_name(root_arg)
-    except ValueError:
+        try:
+            hz = parse_note_name(root_arg)
+        except (ValueError, OverflowError):
+            hz = math.nan
+    if not 0 < hz <= MAX_ROOT_HZ:
         raise argparse.ArgumentTypeError(
-            f"--root must be a Hz number or note name (e.g. 523.25, C5, F#4): got {root_arg!r}"
+            f"--root must be a Hz number in (0, {MAX_ROOT_HZ:g}] or note name (e.g. 523.25, C5, F#4): got {root_arg!r}"
         )
+    return hz
 
 
 def semitone_to_hz(root_hz, semitones):
@@ -110,13 +127,55 @@ def parse_note_triple(arg):
     parts = arg.split(",")
     if len(parts) != 3:
         raise argparse.ArgumentTypeError(f"expected semitones,vol,ms: got {arg!r}")
+    return tuple(parse_clamped_float(lo, hi, name)(p) for (lo, hi, name), p in zip(NOTE_LIMITS, parts))
+
+
+def parse_clamped_float(lo, hi, name):
+    def _parse(arg):
+        try:
+            val = float(arg)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"{name} must be a number between {lo} and {hi}: got {arg!r}")
+        if not math.isfinite(val) or val < lo or val > hi:
+            raise argparse.ArgumentTypeError(f"{name} must be between {lo} and {hi}: got {arg!r}")
+        return val
+
+    return _parse
+
+
+def apply_muffle(mono, amount, sample_rate=SAMPLE_RATE):
+    import numpy as np
+
+    if amount <= 0.0 or not mono.any():
+        return mono
+
+    cutoff = 1500.0 - 1000.0 * amount
+    freqs = np.fft.rfftfreq(len(mono), 1 / sample_rate)
+    out = np.fft.irfft(np.fft.rfft(mono) / (1 + (freqs / cutoff) ** 2), len(mono))
+    return (out * (np.abs(mono).max() / np.abs(out).max())).astype(np.float32)
+
+
+def pan_stereo(mono, pan):
+    import numpy as np
+
+    pan = max(-1.0, min(1.0, float(pan)))
+    theta = (pan + 1.0) * (math.pi / 4.0)
+    return np.column_stack((mono * math.cos(theta), mono * math.sin(theta))).astype(np.float32)
+
+
+def supports_stereo_output():
+    import sounddevice as sd
+
     try:
-        return tuple(float(p) for p in parts)
-    except ValueError:
-        raise argparse.ArgumentTypeError(f"expected semitones,vol,ms (numbers): got {arg!r}")
+        dev = sd.query_devices(kind="output")
+        if isinstance(dev, dict):
+            return dev.get("max_output_channels", 2) >= 2
+    except Exception:
+        pass
+    return True
 
 
-def tone(freq, vol, ms):
+def tone(freq, vol, ms, harmonics=(1.0,)):
     import numpy as np
 
     num_samples = int(SAMPLE_RATE * ms / 1000)
@@ -131,7 +190,8 @@ def tone(freq, vol, ms):
     attack_samples = min(int(SAMPLE_RATE * ATTACK_S), num_samples // 6)
     envelope[:attack_samples] *= np.linspace(0, 1, attack_samples)
 
-    return (vol * np.sin(2 * np.pi * freq * t) * envelope).astype(np.float32)
+    wave = sum(a * np.sin(2 * np.pi * freq * k * t) for k, a in enumerate(harmonics, 1))
+    return (vol * wave / sum(harmonics) * envelope).astype(np.float32)
 
 
 def silence(ms):
@@ -186,10 +246,6 @@ def krumhansl_key_candidates(chroma):
     return sorted(scores, key=lambda x: x[2], reverse=True)
 
 
-def krumhansl_best_key(chroma):
-    return krumhansl_key_candidates(chroma)[0]
-
-
 def format_key_candidates(candidates, n=3):
     return ", ".join(f"{PITCH_CLASSES[t]} {m} ({c:.2f})" for t, m, c in candidates[:n])
 
@@ -198,15 +254,26 @@ def pitch_class_to_hz(pc):
     return 440.0 * 2 ** ((pc - 9) / 12)
 
 
-def detect_key(buffer, sample_rate):
+def best_key(buffer, sample_rate):
     chroma = compute_chroma(buffer, sample_rate)
     if chroma.sum() == 0:
         print("[beep] no signal detected; falling back to 440 Hz", file=sys.stderr)
-        return DEFAULT_ROOT_HZ, "silence"
+        return None
     candidates = krumhansl_key_candidates(chroma)
-    pc, mode, _ = candidates[0]
     print(f"[beep] key candidates: {format_key_candidates(candidates)}", file=sys.stderr)
-    return pitch_class_to_hz(pc), f"{PITCH_CLASSES[pc]} {mode}"
+    return candidates[0]
+
+
+def detect_key(buffer, sample_rate):
+    key = best_key(buffer, sample_rate)
+    if key is None:
+        return DEFAULT_ROOT_HZ, "silence"
+    pc, mode, _ = key
+    return pitch_class_to_hz(pc), f"detected key={PITCH_CLASSES[pc]} {mode}"
+
+
+def detect_quiet_region(buffer, sample_rate):
+    return detect_quiet_freq(buffer, sample_rate), "quietest region"
 
 
 def detect_quiet_freq(buffer, sample_rate, band=QUIET_BAND, smooth_hz=QUIET_SMOOTH_HZ):
@@ -232,13 +299,10 @@ def detect_quiet_freq(buffer, sample_rate, band=QUIET_BAND, smooth_hz=QUIET_SMOO
 
 
 def classify_mic(buffer, sample_rate):
-    chroma = compute_chroma(buffer, sample_rate)
-    if chroma.sum() == 0:
-        print("[beep] no signal detected; falling back to 440 Hz", file=sys.stderr)
+    key = best_key(buffer, sample_rate)
+    if key is None:
         return DEFAULT_ROOT_HZ, "silence"
-    candidates = krumhansl_key_candidates(chroma)
-    pc, mode, corr = candidates[0]
-    print(f"[beep] key candidates: {format_key_candidates(candidates)}", file=sys.stderr)
+    pc, mode, corr = key
     if corr >= MUSIC_CONFIDENCE_THRESHOLD:
         return pitch_class_to_hz(pc), f"music: {PITCH_CLASSES[pc]} {mode} (key confidence {corr:.2f})"
     return detect_quiet_freq(buffer, sample_rate), f"talking: no clear key (confidence {corr:.2f}), using quietest region"
@@ -249,18 +313,26 @@ def build_arg_parser():
     root_group = parser.add_mutually_exclusive_group(required=False)
     root_group.add_argument("--root", type=parse_root, default=None,
                              help="Hz number (523.25) or note name (C5, F#4, Bb3)")
-    root_group.add_argument("--auto-key", nargs="?", type=float,
+    root_group.add_argument("--auto-key", nargs="?", type=parse_clamped_float(0.0, MAX_RECORD_SECONDS, "--auto-key"),
                              const=DEFAULT_AUTO_KEY_SECONDS, default=None, metavar="SECONDS",
                              help=f"record SECONDS (default {DEFAULT_AUTO_KEY_SECONDS}) of mic audio, "
                                   "use detected key's tonic as root")
-    root_group.add_argument("--avoid-speech", nargs="?", type=float,
+    root_group.add_argument("--avoid-speech", nargs="?", type=parse_clamped_float(0.0, MAX_RECORD_SECONDS, "--avoid-speech"),
                              const=DEFAULT_AVOID_SPEECH_SECONDS, default=None, metavar="SECONDS",
                              help=f"record SECONDS (default {DEFAULT_AVOID_SPEECH_SECONDS}) of mic audio, "
                                   "use quietest region as root")
-    root_group.add_argument("--mic", nargs="?", type=float,
+    root_group.add_argument("--mic", nargs="?", type=parse_clamped_float(0.0, MAX_RECORD_SECONDS, "--mic"),
                              const=DEFAULT_MIC_SECONDS, default=None, metavar="SECONDS",
                              help=f"record SECONDS (default {DEFAULT_MIC_SECONDS}) of mic audio, "
                                   "auto-detect music vs talking and use --auto-key or --avoid-speech behavior")
+    parser.add_argument("--pan", type=parse_clamped_float(-1.0, 1.0, "--pan"), default=None,
+                        help="stereo pan from -1.0 (left) to 1.0 (right); overrides Windows detection")
+    parser.add_argument("--muffle", type=parse_clamped_float(0.0, 1.0, "--muffle"), default=None,
+                        help="muffle amount from 0.0 (clear) to 1.0 (behind a wall); overrides Windows detection")
+    parser.add_argument("--ticks", type=int, choices=range(4), default=None,
+                        help="clicks before the melody (virtual-desktop distance); overrides Windows detection")
+    parser.add_argument("--verbose", action="store_true",
+                        help="log resolved spatial settings to stderr")
     parser.add_argument("--hook", action="store_true",
                         help="read hook event JSON from stdin and emit hook JSON to stdout")
     parser.add_argument("--sync", action="store_true",
@@ -269,56 +341,66 @@ def build_arg_parser():
     return parser
 
 
-def resolve_root(args):
-    if args.auto_key is not None:
-        if args.auto_key <= 0:
-            raise SystemExit("--auto-key SECONDS must be > 0")
-        buf = record_audio(args.auto_key)
-        if buf is None:
-            root_hz, desc = DEFAULT_ROOT_HZ, "default (no mic)"
-        else:
-            root_hz, key_name = detect_key(buf, SAMPLE_RATE)
-            desc = f"detected key={key_name} (--auto-key {args.auto_key:.1f}s)"
-    elif args.avoid_speech is not None:
-        if args.avoid_speech <= 0:
-            raise SystemExit("--avoid-speech SECONDS must be > 0")
-        buf = record_audio(args.avoid_speech)
-        if buf is None:
-            root_hz, desc = DEFAULT_ROOT_HZ, "default (no mic)"
-        else:
-            root_hz = detect_quiet_freq(buf, SAMPLE_RATE)
-            desc = f"quietest region (--avoid-speech {args.avoid_speech:.1f}s)"
-    elif args.mic is not None:
-        if args.mic <= 0:
-            raise SystemExit("--mic SECONDS must be > 0")
-        buf = record_audio(args.mic)
-        if buf is None:
-            root_hz, desc = DEFAULT_ROOT_HZ, "default (no mic)"
-        else:
-            root_hz, classification = classify_mic(buf, SAMPLE_RATE)
-            desc = f"{classification} (--mic {args.mic:.1f}s)"
-    elif args.root is not None:
-        root_hz, desc = args.root, "--root"
+def resolve_spatial(args, cwd=None):
+    if None in (args.pan, args.muffle, args.ticks):
+        import spatial
+
+        pan, muffle, ticks, desc = spatial.detect_spatial(cwd)
     else:
-        root_hz, desc = DEFAULT_ROOT_HZ, "default"
+        pan, muffle, ticks, desc = 0.0, 0.0, 0, "manual"
+    pan = pan if args.pan is None else args.pan
+    muffle = muffle if args.muffle is None else args.muffle
+    ticks = ticks if args.ticks is None else args.ticks
+    if args.verbose:
+        print(f"[beep] spatial pan={pan:.2f} muffle={muffle:.2f} ticks={ticks} ({desc})", file=sys.stderr)
+    return pan, muffle, ticks
+
+
+def resolve_root(args):
+    mic_modes = (
+        ("--auto-key", args.auto_key, detect_key),
+        ("--avoid-speech", args.avoid_speech, detect_quiet_region),
+        ("--mic", args.mic, classify_mic),
+    )
+    for flag, seconds, analyze in mic_modes:
+        if seconds is None:
+            continue
+        if seconds <= 0:
+            raise SystemExit(f"{flag} SECONDS must be > 0")
+        buf = record_audio(seconds)
+        if buf is None:
+            root_hz, desc = DEFAULT_ROOT_HZ, "default (no mic)"
+        else:
+            root_hz, what = analyze(buf, SAMPLE_RATE)
+            desc = f"{what} ({flag} {seconds:.1f}s)"
+        break
+    else:
+        root_hz, desc = (args.root, "--root") if args.root is not None else (DEFAULT_ROOT_HZ, "default")
 
     root_hz = octave_cap(root_hz)
     print(f"[beep] root={root_hz:.2f} Hz ({desc})", file=sys.stderr)
     return root_hz
 
 
-def play_notes(root_hz, notes):
+def play_notes(root_hz, notes, pan=0.0, muffle=0.0, ticks=0):
     import numpy as np
     import sounddevice as sd
 
+    harmonics = MUFFLE_HARMONICS if muffle > 0 else (1.0,)
     chunks = []
     for semitones, vol, ms in notes:
         freq = octave_cap(semitone_to_hz(root_hz, semitones))
-        chunks.append(tone(freq, vol, ms))
+        chunks.append(tone(freq, vol, ms, harmonics))
         chunks.append(silence(GAP_MS))
 
     if chunks:
-        sd.play(np.concatenate(chunks + [silence(TAIL_MS)]), SAMPLE_RATE)
+        audio = apply_muffle(np.concatenate(chunks + [silence(TAIL_MS)]), muffle)
+        if ticks:
+            click = [tone(CLICK_HZ, CLICK_VOL, CLICK_MS), silence(CLICK_GAP_MS)]
+            audio = np.concatenate(click * ticks + [silence(CLICK_LEAD_MS), audio])
+        if supports_stereo_output():
+            audio = pan_stereo(audio, pan)
+        sd.play(audio, SAMPLE_RATE)
         sd.wait()
 
 
@@ -360,8 +442,17 @@ def build_root_flags(args) -> list[str]:
     return []
 
 
-def spawn_detached(root_flags: list[str], melody: tuple[str, ...]) -> None:
-    cmd = [sys.executable, str(pathlib.Path(__file__).resolve()), *root_flags, "--", *melody]
+def spawn_detached(root_flags: list[str], melody: tuple[str, ...], pan: float, muffle: float, ticks: int) -> None:
+    cmd = [
+        sys.executable,
+        str(pathlib.Path(__file__).resolve()),
+        *root_flags,
+        f"--pan={pan:.4f}",
+        f"--muffle={muffle:.4f}",
+        f"--ticks={ticks}",
+        "--",
+        *melody,
+    ]
     kwargs: dict = {
         "stdin": subprocess.DEVNULL,
         "stdout": subprocess.DEVNULL,
@@ -376,23 +467,22 @@ def spawn_detached(root_flags: list[str], melody: tuple[str, ...]) -> None:
 
 
 def run_hook(args) -> int:
-    raw = sys.stdin.read()
-    payload = {}
-    if raw.strip():
-        try:
-            parsed = json.loads(raw)
-            if isinstance(parsed, dict):
-                payload = parsed
-        except json.JSONDecodeError:
-            pass
-
-    melody_key, response = resolve_hook_event(payload)
-    melody = HOOK_MELODIES.get(melody_key) if melody_key else None
-    if melody:
-        if args.sync:
-            play_notes(resolve_root(args), [parse_note_triple(m) for m in melody])
-        else:
-            spawn_detached(build_root_flags(args), melody)
+    response = {}
+    try:
+        payload = json.loads(sys.stdin.buffer.read().decode("utf-8", "replace").strip() or "{}")
+        if not isinstance(payload, dict):
+            payload = {}
+        melody_key, response = resolve_hook_event(payload)
+        melody = HOOK_MELODIES.get(melody_key) if melody_key else None
+        if melody:
+            cwd = payload.get("cwd")
+            placement = resolve_spatial(args, cwd if isinstance(cwd, str) else None)
+            if args.sync:
+                play_notes(resolve_root(args), [parse_note_triple(m) for m in melody], *placement)
+            else:
+                spawn_detached(build_root_flags(args), melody, *placement)
+    except Exception as e:
+        print(f"[beep] hook error: {e!r}", file=sys.stderr)
 
     print(json.dumps(response))
     return 0
@@ -409,7 +499,7 @@ def main(argv=None):
     if args.hook:
         return run_hook(args)
 
-    play_notes(resolve_root(args), args.notes)
+    play_notes(resolve_root(args), args.notes, *resolve_spatial(args))
     return 0
 
 
