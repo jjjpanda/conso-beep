@@ -134,6 +134,63 @@ class AudioDspTest(unittest.TestCase):
         self.assertEqual(mono_played[0].ndim, 1)
         self.assertAlmostEqual(float(np.max(np.abs(mono_played[0]))), 0.25, places=5)
 
+    def test_play_notes_ticks_peak_and_length(self):
+        played = []
+        notes = [(0.0, 0.9, 99.0)]
+        with mock.patch.object(audio, "supports_stereo_output", return_value=True), \
+                mock.patch.object(audio.sd, "play", side_effect=lambda data, sr, latency=None: played.append(data)):
+            audio.play_notes(440.0, 0.5, notes, ticks=0, wait=False)
+            audio.play_notes(440.0, 0.5, notes, ticks=2, wait=False)
+        tick_n = int(audio.SAMPLE_RATE * audio.TICK_MS / 1000)
+        gap_n = len(audio.silence(audio.CLICK_GAP_MS))
+        lead_n = len(audio.silence(audio.CLICK_LEAD_MS))
+        self.assertEqual(len(played[1]) - len(played[0]), 2 * (tick_n + gap_n) + lead_n)
+        np.testing.assert_allclose(played[1][:, 0], played[1][:, 1])
+        self.assertAlmostEqual(float(np.max(np.abs(played[1][:tick_n]))), 0.5 * audio.TICK_VOL, places=4)
+        self.assertEqual(float(np.max(np.abs(played[1][tick_n:tick_n + gap_n]))), 0.0)
+
+    def test_mic_ring_resolve_for_args_modes(self):
+        parser = beep.build_arg_parser()
+        sr = audio.SAMPLE_RATE
+        rng = np.random.default_rng(3)
+        ring = audio.MicRing()
+        ring._on_audio((0.05 * rng.standard_normal((sr * 20, 1))).astype(np.float32), sr * 20, None, None)
+        short = ring._slice_tail(1.0)
+        quiet_root = audio.fold_root(audio.detect_quiet_freq(short, sr))
+        _, ambient_gain = audio.ambient_level(short)
+        analyzed = []
+
+        def resolve(argv, state, **kw):
+            def fake_state(buf):
+                analyzed.append(len(buf))
+                return state
+            with mock.patch.object(ring, "ensure_stream", return_value=True), \
+                    mock.patch.object(ring, "_analyze_key_state", side_effect=fake_state), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                return ring.resolve_for_args(parser.parse_args(argv + ["--melody", "done"]), **kw)
+
+        self.assertEqual(resolve(["--mic", "1"], ("talking", 0, 0.1)), (quiet_root, ambient_gain, "marimba"))
+        self.assertEqual(analyzed[-1], int(audio.KEY_WINDOW_S * sr))
+        self.assertEqual(resolve(["--mic", "1"], ("music", 9, 0.8)), (880.0, ambient_gain, "sine"))
+        self.assertEqual(
+            resolve(["--auto-key", "1"], ("talking", 7, 0.1)),
+            (audio.fold_root(audio.key_root_hz(7)), ambient_gain, "sine"),
+        )
+        self.assertEqual(resolve(["--mic", "1"], ("silence", None, 0.0)), (880.0, ambient_gain, "sine"))
+        self.assertEqual(
+            resolve(["--mic", "1"], ("music", 9, 0.8), gain_override=0.6, timbre_override="marimba"),
+            (880.0, 0.6, "marimba"),
+        )
+
+        root_hz, gain, timbre, _ = audio.analyze_mic("--avoid-speech", ring._slice_tail(1.5))
+        self.assertEqual(resolve(["--avoid-speech", "1.5"], None), (audio.fold_root(root_hz), gain, timbre))
+
+        with mock.patch.object(ring, "ensure_stream", return_value=False), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(
+                ring.resolve_for_args(parser.parse_args(["--mic", "1", "--melody", "done"])),
+                (880.0, audio.DEFAULT_GAIN, audio.DEFAULT_TIMBRE),
+            )
+
     def test_framed_chroma_song_progression_and_noise_rejection(self):
         sr = audio.SAMPLE_RATE
         rng = np.random.default_rng(7)
@@ -215,6 +272,7 @@ class DaemonHttpTest(unittest.TestCase):
                 daemon=True,
             )
             t.start()
+            self.daemon_thread = t
             self.assertTrue(ready.wait(timeout=2.0))
             port = ports[0]
             status, html = self._http("GET", port, "/")
@@ -225,7 +283,8 @@ class DaemonHttpTest(unittest.TestCase):
             try:
                 yield port, token, played, played_event
             finally:
-                self._http("POST", port, "/api/stop", {}, {"X-Conso-Token": token})
+                with contextlib.suppress(OSError):
+                    self._http("POST", port, "/api/stop", {}, {"X-Conso-Token": token})
                 t.join(timeout=3.0)
 
     def _http(self, method, port, path, body=None, headers=None):
@@ -364,6 +423,32 @@ class DaemonHttpTest(unittest.TestCase):
             )
             t3.join(timeout=2.0)
             self.assertEqual(json.loads(out_buf.getvalue()), {"decision": "deny", "reason": "nope"})
+
+    def test_idle_exit_unless_keep_alive_or_pending_permission(self):
+        with mock.patch.object(daemon, "DAEMON_IDLE_S", 1.0), self.running_daemon() as (port, token, _played, _ev):
+            auth = {"X-Conso-Token": token}
+            self._http("POST", port, "/api/controls", {"keep_alive": True}, auth)
+            time.sleep(1.6)
+            self.assertTrue(self.daemon_thread.is_alive())
+
+            self._http("POST", port, "/api/controls", {"keep_alive": False}, auth)
+            ask = threading.Thread(
+                target=beep.http_post_json,
+                args=("/api/permissions", {"title": "Idle test", "timeout": 2.5}),
+                kwargs={"port": port, "timeout": 5.0},
+            )
+            ask.start()
+            for _ in range(40):
+                _, raw = self._http("GET", port, "/api/status")
+                if json.loads(raw)["permissions"]:
+                    break
+                time.sleep(0.025)
+            time.sleep(1.6)
+            self.assertTrue(self.daemon_thread.is_alive())
+
+            ask.join(timeout=3.0)
+            self.daemon_thread.join(timeout=3.0)
+            self.assertFalse(self.daemon_thread.is_alive())
 
     def test_permission_timeout_and_security(self):
         with self.running_daemon() as (port, token, _played, _played_event):
