@@ -20,7 +20,7 @@ pip install sounddevice numpy
 python beep.py --root C5 -- 0,0.4,55 4,0.5,55 7,0.55,80
 ```
 
-On Windows, the beep pans toward the monitor or virtual desktop it came from. Beeps from other desktops sound muffled, with one click per desktop away.
+On Windows, the beep pans toward the monitor or virtual desktop it came from. Beeps from other desktops sound muffled, with one pluck per desktop away.
 
 **Hook runner (`--hook`):**
 
@@ -30,4 +30,4 @@ Reads hook JSON from `stdin`, plays the melody for that event in a detached proc
 
 Point the harness lifecycle hooks at `python <path>/beep.py --hook --mic`. For harnesses that load plugins from a folder, clone the repo there; `plugin.json` and `hooks.json` are the manifest.
 
-`--mic` listens for 2 seconds before each beep to pick a pitch that fits the room.
+`--mic` picks a pitch that fits the room and a volume that fits its background noise. The first call starts a background mic daemon (`--listen`) and records for 2 seconds. Later calls read the daemon's rolling buffer and play at once. The daemon exits after 10 idle minutes.

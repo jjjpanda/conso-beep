@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
-"""Usage: beep.py [--root HZ|NOTE | --auto-key [SECONDS] | --avoid-speech [SECONDS] | --mic [SECONDS]] [--pan PAN] [--muffle MUFFLE] [--ticks N] [--verbose] [--hook [--sync]] [-- semitones,vol,ms ...]
+"""Usage: beep.py [--root HZ|NOTE | --auto-key [SECONDS] | --avoid-speech [SECONDS] | --mic [SECONDS]] [--pan PAN] [--muffle MUFFLE] [--ticks N] [--verbose] [--hook [--sync] | --melody NAME | -- semitones,vol,ms ...]
+       beep.py --listen
   semitones: signed offset from root (0 = root note), -48 to 48
-  vol:       0.0-1.0
-  ms:        duration in milliseconds, 0-10000
+  vol:       0.0-1.0; 0 is a rest
+  ms:        time until the next note in milliseconds, 0-10000; notes ring past it
 
   --root         Hz number (523.25) or note name (C5, F#4, Bb3). Default: 440 (A4). Max 20000.
+                 Folded by octaves into 600-1200 Hz
   --auto-key     record SECONDS (default 2) of mic audio, use detected key's tonic as root
   --avoid-speech record SECONDS (default 1.5) of mic audio, use quietest region as root
   --mic          record SECONDS (default 2) of mic audio, auto-detect music vs talking
-                 (by key-detection confidence) and pick --auto-key or --avoid-speech behavior
+                 (by key-detection confidence) and pick --auto-key or --avoid-speech behavior.
+                 Mic modes also scale volume to background loudness
   --pan          stereo pan from -1.0 (left) to 1.0 (right); overrides Windows detection
   --muffle       muffle amount from 0.0 (clear) to 1.0 (behind a wall); overrides Windows detection
   --ticks        0-3 clicks before the melody (virtual-desktop distance); overrides Windows detection
@@ -16,9 +19,12 @@
   --hook         read LLM harness hook JSON from stdin, trigger matching
                  melody, and emit hook JSON to stdout
   --sync         play audio synchronously in --hook mode instead of spawning detached
+  --melody       play a named melody from HOOK_MELODIES (e.g. Stop, Notification:idle_prompt)
+  --listen       run the mic daemon: keep a rolling mic buffer and answer mic-mode
+                 root queries on localhost so beeps need not record first. Mic modes
+                 start it on demand; it exits after 10 idle minutes
 
-Melody fundamentals are octave-folded to stay at or below 800 Hz (ticks and muffle
-overtones are higher). Mic recording is capped at 30 seconds.
+Mic recording is capped at 30 seconds. Without a mic mode, volume is 0.5.
 
 Note: positional notes must follow a `--` separator (negative offsets look like
 flags to argparse otherwise), e.g. beep.py --root 440 -- -3,0.7,90
@@ -32,14 +38,26 @@ import subprocess
 import sys
 
 SAMPLE_RATE = 44100
-GAP_MS = 12
-TAIL_MS = 150
-DECAY_RATE = 5
-ATTACK_S = 0.004
-MUFFLE_HARMONICS = (1.0, 0.3, 0.15, 0.08)
-CLICK_HZ = 2200.0
-CLICK_VOL = 0.5
-CLICK_MS = 8
+BELL_PARTIALS = ((1, 1.0, 0.275), (2, 0.22, 0.11), (3, 0.04, 0.04), (4, 0.15, 0.03))
+TONE_LENGTH = 0.15
+BELL_ATTACK_S = 0.0035
+BELL_RELEASE_S = 0.013
+NOTE_RING_S = 0.68
+TEMPO = 0.93
+LEAD_S = 0.001
+STEREO_SPREAD = 0.24
+STUTTER_COUNT = 1
+STUTTER_GRAIN_S = 0.035
+STUTTER_SPACING_S = 0.039
+STUTTER_LEVEL = 0.5
+STUTTER_DECAY_S = 0.008
+AMBIENT_DB = (-55.0, -25.0)
+AMBIENT_GAIN = (0.27, 0.8)
+DEFAULT_GAIN = 0.27
+AMBIENT_FRAME_S = 0.05
+AMBIENT_PERCENTILE = 30
+TICK_VOL = 0.5
+TICK_MS = 30
 CLICK_GAP_MS = 85
 CLICK_LEAD_MS = 60
 
@@ -47,7 +65,7 @@ DEFAULT_ROOT_HZ = 440.0
 DEFAULT_AUTO_KEY_SECONDS = 2.0
 DEFAULT_AVOID_SPEECH_SECONDS = 1.5
 DEFAULT_MIC_SECONDS = 2.0
-MAX_HZ = 800.0
+ROOT_BAND_HZ = 1200.0
 MAX_ROOT_HZ = 20000.0
 MAX_RECORD_SECONDS = 30.0
 NOTE_LIMITS = ((-48.0, 48.0, "semitones"), (0.0, 1.0, "vol"), (0.0, 10000.0, "ms"))
@@ -55,6 +73,9 @@ MUSIC_CONFIDENCE_THRESHOLD = 0.55
 CHROMA_FMIN, CHROMA_FMAX = 65.0, 2100.0
 QUIET_BAND = (200.0, 4000.0)
 QUIET_SMOOTH_HZ = 30.0
+DAEMON_PORT = 47391
+DAEMON_IDLE_S = 600
+DAEMON_TIMEOUT_S = 0.25
 
 PITCH_CLASSES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 NOTE_LETTER_SEMITONES = {"C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11}
@@ -71,16 +92,17 @@ ANTIGRAVITY_FAILURE_REASONS = (
 )
 
 HOOK_MELODIES: dict[str, tuple[str, ...]] = {
-    "SessionStart": ("0,0.9,55", "4,1.0,55", "7,1.0,80"),
-    "Stop": ("0,0.9,80", "-4,0.9,110"),
-    "StopFailure": ("0,0.9,90", "-3,0.95,90", "-6,1.0,160"),
-    "PostToolUseFailure": ("0,0.9,70", "-3,1.0,120"),
-    "PostCompact": ("0,0.9,45", "2,1.0,65"),
-    "SubagentStop": ("0,0.9,55", "-3,0.95,75"),
-    "Notification:permission_prompt": ("0,0.9,100", "3,1.0,80", "7,1.0,140"),
-    "Notification:idle_prompt": ("0,0.9,55", "0,0.9,90", "-5,0.95,55"),
-    "Notification:auth_success": ("0,0.9,45", "4,1.0,45", "7,1.0,45", "12,1.0,90"),
-    "Notification:elicitation_dialog": ("0,0.9,55", "6,1.0,75", "3,0.9,55"),
+    "SessionStart": ("0,0.9,72", "4,1,72", "7,1,99"),
+    "Stop": ("0,0.9,99", "-4,0.9,131"),
+    "StopFailure": ("0,0.9,110", "-3,0.95,110", "-6,1,185"),
+    "PostToolUseFailure": ("5,0.7,90", "-1,0.7,220"),
+    "PostCompact": ("0,0.9,61", "2,1,83"),
+    "SubagentStop": ("0,0.9,72", "-3,0.95,94"),
+    "Notification:permission_prompt": ("0,1,90", "7,1,120", "9,1,90", "14,1,160"),
+    "Notification:idle_prompt": ("0,0.9,72", "0,0.9,110", "-5,0.95,72"),
+    "Notification:auth_success": ("0,1,60", "4,1,60", "7,1,60", "12,1,60", "16,1,240"),
+    "Notification:elicitation_dialog": ("4,1,80", "6,1,80", "2,1,80", "7,1,90", "11,1,260"),
+    "RulesMissing": ("6,1,110", "1,1,110", "6,1,260"),
 }
 
 
@@ -117,17 +139,19 @@ def semitone_to_hz(root_hz, semitones):
     return root_hz * 2 ** (semitones / 12)
 
 
-def octave_cap(freq, max_hz=MAX_HZ):
-    while freq > max_hz:
+def fold_root(freq, band_hz=ROOT_BAND_HZ):
+    while freq > band_hz:
         freq /= 2
+    while freq <= band_hz / 2:
+        freq *= 2
     return freq
 
 
-def parse_note_triple(arg):
+def parse_note(arg):
     parts = arg.split(",")
     if len(parts) != 3:
         raise argparse.ArgumentTypeError(f"expected semitones,vol,ms: got {arg!r}")
-    return tuple(parse_clamped_float(lo, hi, name)(p) for (lo, hi, name), p in zip(NOTE_LIMITS, parts))
+    return tuple(parse_clamped_float(*limits)(p) for limits, p in zip(NOTE_LIMITS, parts))
 
 
 def parse_clamped_float(lo, hi, name):
@@ -175,23 +199,50 @@ def supports_stereo_output():
     return True
 
 
-def tone(freq, vol, ms, harmonics=(1.0,)):
+def bell_partials():
+    return tuple((r, w, tau * TONE_LENGTH) for r, w, tau in BELL_PARTIALS)
+
+
+def bell(freq, num_samples, partials, attack_s):
     import numpy as np
 
-    num_samples = int(SAMPLE_RATE * ms / 1000)
-    if num_samples == 0 or vol <= 0:
-        return np.zeros(num_samples, dtype=np.float32)
+    t = np.arange(num_samples) / SAMPLE_RATE
+    body = sum(w * np.sin(2 * np.pi * freq * r * t) * np.exp(-t / tau) for r, w, tau in partials)
+    envelope = np.minimum(t / attack_s, 1)
+    release = min(num_samples, int(SAMPLE_RATE * BELL_RELEASE_S))
+    envelope[num_samples - release:] *= np.arange(release - 1, -1, -1) / max(release, 1)
+    return body * envelope
 
-    duration_s = ms / 1000
-    t = np.linspace(0, duration_s, num_samples, endpoint=False)
 
-    envelope = np.exp(-DECAY_RATE * t / duration_s)
+def place(out, mono, onset, pan):
+    onset = max(onset, 0)
+    n = min(len(mono), len(out) - onset)
+    if n > 0:
+        out[onset:onset + n] += pan_stereo(mono[:n], pan)
 
-    attack_samples = min(int(SAMPLE_RATE * ATTACK_S), num_samples // 6)
-    envelope[:attack_samples] *= np.linspace(0, 1, attack_samples)
 
-    wave = sum(a * np.sin(2 * np.pi * freq * k * t) for k, a in enumerate(harmonics, 1))
-    return (vol * wave / sum(harmonics) * envelope).astype(np.float32)
+def render_phrase(root_hz, notes):
+    import numpy as np
+
+    partials = bell_partials()
+    ring = int(SAMPLE_RATE * NOTE_RING_S * TONE_LENGTH)
+    lead = int(SAMPLE_RATE * LEAD_S)
+    starts = [lead + round(SAMPLE_RATE * ms * TEMPO / 1000) for ms in np.cumsum([0] + [ms for *_, ms in notes])]
+    voiced = [(semi, vol, start) for (semi, vol, _), start in zip(notes, starts) if vol > 0]
+    if not voiced:
+        return None
+
+    out = np.zeros((starts[-1] + ring, 2))
+    grain = int(SAMPLE_RATE * STUTTER_GRAIN_S)
+    grain_window = np.exp(-np.arange(grain) / (SAMPLE_RATE * STUTTER_DECAY_S))
+    for k, (semi, vol, onset) in enumerate(voiced):
+        freq, pan = semitone_to_hz(root_hz, semi), STEREO_SPREAD * (-1) ** k
+        place(out, vol * bell(freq, ring, partials, BELL_ATTACK_S), onset, pan)
+        if k in (0, len(voiced) - 1):
+            stutter = STUTTER_LEVEL * vol * bell(freq, grain, partials, BELL_ATTACK_S) * grain_window
+            for j in range(2, STUTTER_COUNT + 2):
+                place(out, stutter, onset - int(SAMPLE_RATE * STUTTER_SPACING_S * j), pan)
+    return out
 
 
 def silence(ms):
@@ -308,6 +359,21 @@ def classify_mic(buffer, sample_rate):
     return detect_quiet_freq(buffer, sample_rate), f"talking: no clear key (confidence {corr:.2f}), using quietest region"
 
 
+MIC_ANALYZERS = {"--auto-key": detect_key, "--avoid-speech": detect_quiet_region, "--mic": classify_mic}
+
+
+def analyze_mic(flag, buffer):
+    import numpy as np
+
+    root_hz, what = MIC_ANALYZERS[flag](buffer, SAMPLE_RATE)
+    frame = int(SAMPLE_RATE * AMBIENT_FRAME_S)
+    frames = buffer[: len(buffer) // frame * frame].reshape(-1, frame)
+    floor_rms = np.percentile(np.sqrt(np.mean(frames ** 2, axis=1)), AMBIENT_PERCENTILE)
+    level_db = 20 * math.log10(max(float(floor_rms), 1e-9))
+    gain = float(np.interp(level_db, AMBIENT_DB, AMBIENT_GAIN))
+    return root_hz, gain, f"{what}, ambient {level_db:.0f} dBFS"
+
+
 def build_arg_parser():
     parser = argparse.ArgumentParser(prog="beep.py")
     root_group = parser.add_mutually_exclusive_group(required=False)
@@ -337,7 +403,11 @@ def build_arg_parser():
                         help="read hook event JSON from stdin and emit hook JSON to stdout")
     parser.add_argument("--sync", action="store_true",
                         help="play audio synchronously in --hook mode instead of spawning a detached subprocess")
-    parser.add_argument("notes", nargs="*", type=parse_note_triple, metavar="semitones,vol,ms")
+    parser.add_argument("--melody", choices=HOOK_MELODIES, default=None,
+                        help="play a named melody instead of positional notes")
+    parser.add_argument("--listen", action="store_true",
+                        help="run the background mic daemon that serves cached mic-mode roots")
+    parser.add_argument("notes", nargs="*", type=parse_note, metavar="semitones,vol,ms")
     return parser
 
 
@@ -356,52 +426,112 @@ def resolve_spatial(args, cwd=None):
     return pan, muffle, ticks
 
 
-def resolve_root(args):
-    mic_modes = (
-        ("--auto-key", args.auto_key, detect_key),
-        ("--avoid-speech", args.avoid_speech, detect_quiet_region),
-        ("--mic", args.mic, classify_mic),
-    )
-    for flag, seconds, analyze in mic_modes:
+def query_daemon(flag, seconds):
+    import socket
+
+    try:
+        with socket.create_connection(("127.0.0.1", DAEMON_PORT), timeout=DAEMON_TIMEOUT_S) as conn:
+            conn.sendall(f"{flag} {seconds}".encode())
+            hz, gain, what = conn.recv(256).decode().split(" ", 2)
+            return float(hz), float(gain), f"{what}, cached"
+    except OSError:
+        spawn_detached(["--listen"])
+    except ValueError:
+        pass
+    return None
+
+
+def listen():
+    import socket
+
+    server = socket.socket()
+    if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+    try:
+        server.bind(("127.0.0.1", DAEMON_PORT))
+    except OSError:
+        return 0
+    server.listen()
+    server.settimeout(DAEMON_IDLE_S)
+
+    import threading
+    import numpy as np
+    import sounddevice as sd
+
+    ring = np.zeros(int(MAX_RECORD_SECONDS * SAMPLE_RATE), dtype=np.float32)
+    state = {"pos": 0, "filled": 0}
+    lock = threading.Lock()
+
+    def on_audio(indata, frames, _time, _status):
+        with lock:
+            ring[(state["pos"] + np.arange(frames)) % len(ring)] = indata[:, 0]
+            state["pos"] = (state["pos"] + frames) % len(ring)
+            state["filled"] = min(len(ring), state["filled"] + frames)
+
+    def latest(n):
+        with lock:
+            return np.roll(ring, -state["pos"])[-n:] if 0 < n <= state["filled"] else None
+
+    with server, sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32", callback=on_audio):
+        while True:
+            try:
+                conn, _ = server.accept()
+            except TimeoutError:
+                return 0
+            with conn:
+                try:
+                    conn.settimeout(DAEMON_TIMEOUT_S)
+                    flag, seconds = conn.recv(64).decode().split()
+                    buf = latest(int(float(seconds) * SAMPLE_RATE))
+                    if buf is not None:
+                        root_hz, gain, what = analyze_mic(flag, buf)
+                        conn.sendall(f"{root_hz} {gain} {what}".encode())
+                except (OSError, ValueError, OverflowError, KeyError):
+                    pass
+
+
+def resolve_mic(args):
+    mic_modes = (("--auto-key", args.auto_key), ("--avoid-speech", args.avoid_speech), ("--mic", args.mic))
+    for flag, seconds in mic_modes:
         if seconds is None:
             continue
         if seconds <= 0:
             raise SystemExit(f"{flag} SECONDS must be > 0")
-        buf = record_audio(seconds)
-        if buf is None:
-            root_hz, desc = DEFAULT_ROOT_HZ, "default (no mic)"
-        else:
-            root_hz, what = analyze(buf, SAMPLE_RATE)
-            desc = f"{what} ({flag} {seconds:.1f}s)"
+        result = query_daemon(flag, seconds)
+        if result is None:
+            buf = record_audio(seconds)
+            result = (DEFAULT_ROOT_HZ, DEFAULT_GAIN, "default (no mic)") if buf is None else analyze_mic(flag, buf)
+        root_hz, gain, what = result
+        desc = f"{what} ({flag} {seconds:.1f}s)"
         break
     else:
         root_hz, desc = (args.root, "--root") if args.root is not None else (DEFAULT_ROOT_HZ, "default")
+        gain = DEFAULT_GAIN
 
-    root_hz = octave_cap(root_hz)
-    print(f"[beep] root={root_hz:.2f} Hz ({desc})", file=sys.stderr)
-    return root_hz
+    root_hz = fold_root(root_hz)
+    print(f"[beep] root={root_hz:.2f} Hz gain={gain:.2f} ({desc})", file=sys.stderr)
+    return root_hz, gain
 
 
-def play_notes(root_hz, notes, pan=0.0, muffle=0.0, ticks=0):
+def play_notes(root_hz, gain, notes, pan=0.0, muffle=0.0, ticks=0):
     import numpy as np
     import sounddevice as sd
 
-    harmonics = MUFFLE_HARMONICS if muffle > 0 else (1.0,)
-    chunks = []
-    for semitones, vol, ms in notes:
-        freq = octave_cap(semitone_to_hz(root_hz, semitones))
-        chunks.append(tone(freq, vol, ms, harmonics))
-        chunks.append(silence(GAP_MS))
-
-    if chunks:
-        audio = apply_muffle(np.concatenate(chunks + [silence(TAIL_MS)]), muffle)
-        if ticks:
-            click = [tone(CLICK_HZ, CLICK_VOL, CLICK_MS), silence(CLICK_GAP_MS)]
-            audio = np.concatenate(click * ticks + [silence(CLICK_LEAD_MS), audio])
-        if supports_stereo_output():
-            audio = pan_stereo(audio, pan)
-        sd.play(audio, SAMPLE_RATE)
-        sd.wait()
+    audio = render_phrase(root_hz, notes)
+    if audio is None:
+        return
+    audio = np.stack([apply_muffle(channel, muffle) for channel in audio.T], axis=1)
+    if ticks:
+        pluck = TICK_VOL * bell(2 * root_hz, int(SAMPLE_RATE * TICK_MS / 1000), bell_partials(), BELL_ATTACK_S)
+        click = np.concatenate([pluck, silence(CLICK_GAP_MS)] * ticks
+                               + [silence(CLICK_LEAD_MS)])
+        audio = np.concatenate([np.column_stack((click, click)), audio])
+    audio = pan_stereo(np.ones(1), pan) * math.sqrt(2) * audio
+    audio = gain * audio / max(np.abs(audio).max(), 1e-9)
+    if not supports_stereo_output():
+        audio = audio.mean(axis=1)
+    sd.play(audio.astype(np.float32), SAMPLE_RATE)
+    sd.wait()
 
 
 def resolve_hook_event(payload: dict) -> tuple[str | None, dict]:
@@ -442,17 +572,8 @@ def build_root_flags(args) -> list[str]:
     return []
 
 
-def spawn_detached(root_flags: list[str], melody: tuple[str, ...], pan: float, muffle: float, ticks: int) -> None:
-    cmd = [
-        sys.executable,
-        str(pathlib.Path(__file__).resolve()),
-        *root_flags,
-        f"--pan={pan:.4f}",
-        f"--muffle={muffle:.4f}",
-        f"--ticks={ticks}",
-        "--",
-        *melody,
-    ]
+def spawn_detached(beep_args: list[str]) -> None:
+    cmd = [sys.executable, str(pathlib.Path(__file__).resolve()), *beep_args]
     kwargs: dict = {
         "stdin": subprocess.DEVNULL,
         "stdout": subprocess.DEVNULL,
@@ -478,9 +599,11 @@ def run_hook(args) -> int:
             cwd = payload.get("cwd")
             placement = resolve_spatial(args, cwd if isinstance(cwd, str) else None)
             if args.sync:
-                play_notes(resolve_root(args), [parse_note_triple(m) for m in melody], *placement)
+                play_notes(*resolve_mic(args), [parse_note(m) for m in melody], *placement)
             else:
-                spawn_detached(build_root_flags(args), melody, *placement)
+                pan, muffle, ticks = placement
+                spawn_detached([*build_root_flags(args), f"--pan={pan:.4f}", f"--muffle={muffle:.4f}",
+                                f"--ticks={ticks}", "--", *melody])
     except Exception as e:
         print(f"[beep] hook error: {e!r}", file=sys.stderr)
 
@@ -493,13 +616,19 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.hook and args.notes:
         parser.error("positional notes cannot be combined with --hook")
+    if args.listen:
+        return listen()
+    if args.melody:
+        if args.hook or args.notes:
+            parser.error("--melody cannot be combined with --hook or positional notes")
+        args.notes = [parse_note(m) for m in HOOK_MELODIES[args.melody]]
     if not args.hook and not args.notes:
-        parser.error("at least one semitones,vol,ms note is required unless --hook is set")
+        parser.error("at least one semitones,vol,ms note is required unless --hook or --listen is set")
 
     if args.hook:
         return run_hook(args)
 
-    play_notes(resolve_root(args), args.notes, *resolve_spatial(args))
+    play_notes(*resolve_mic(args), args.notes, *resolve_spatial(args))
     return 0
 
 
