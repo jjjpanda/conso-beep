@@ -122,8 +122,14 @@ def parse_note(arg):
     return tuple(parse_clamped_float(*limits)(p) for limits, p in zip(NOTE_LIMITS, parts))
 
 
+class BeepArgumentParser(argparse.ArgumentParser):
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        self.exit(1, f"{self.prog}: error: {message}\n")
+
+
 def build_arg_parser():
-    parser = argparse.ArgumentParser(prog="beep.py")
+    parser = BeepArgumentParser(prog="beep.py")
     root_group = parser.add_mutually_exclusive_group(required=False)
     root_group.add_argument("--root", type=parse_root, default=None,
                             help="Hz number (523.25) or note name (C5, F#4, Bb3)")

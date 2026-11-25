@@ -24,18 +24,21 @@ class BeepCliTest(unittest.TestCase):
         parser = beep.build_arg_parser()
         for bad in ("0", "-1", "31", "nan", "inf"):
             with contextlib.redirect_stderr(io.StringIO()):
-                with self.assertRaises(SystemExit):
+                with self.assertRaises(SystemExit) as ctx:
                     parser.parse_args(["--mic", bad, "--melody", "done"])
+            self.assertEqual(ctx.exception.code, 1)
 
     def test_cli_mutual_exclusion(self):
         for argv in (
             ["--listen", "--sync", "--melody", "done"],
             ["--melody", "done", "--", "0,0.5,50"],
+            ["--melody", "nonexistent"],
             [],
         ):
             with contextlib.redirect_stderr(io.StringIO()):
-                with self.assertRaises(SystemExit):
+                with self.assertRaises(SystemExit) as ctx:
                     beep.main(argv)
+            self.assertEqual(ctx.exception.code, 1)
 
     def test_melodies_parse_cleanly(self):
         for name, raw in beep.MELODIES.items():
