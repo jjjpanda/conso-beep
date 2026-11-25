@@ -9,7 +9,7 @@
   --root         Hz number (523.25) or note name (C5, F#4, Bb3). Default: 440 (A4). Max 20000.
                  Folded by octaves into 450-900 Hz
   --auto-key     record SECONDS (default 2) of mic audio, use detected key signature's root
-  --avoid-speech record SECONDS (default 1.5) of mic audio, use quietest region in 400-800 Hz as root
+  --avoid-speech record SECONDS (default 1.5) of mic audio, use quietest region in 450-900 Hz as root
   --mic          record SECONDS (default 2) of mic audio, auto-detect music vs talking
                  (by key-detection confidence) and pick --auto-key or --avoid-speech behavior.
                  Mic modes also scale volume to background loudness
@@ -146,7 +146,7 @@ def build_arg_parser():
     root_group.add_argument("--avoid-speech", nargs="?", type=parse_positive_float(MAX_RECORD_SECONDS, "--avoid-speech"),
                             const=DEFAULT_AVOID_SPEECH_SECONDS, default=None, metavar="SECONDS",
                             help=f"record SECONDS (default {DEFAULT_AVOID_SPEECH_SECONDS}) of mic audio, "
-                                 "use quietest region in 400-800 Hz as root")
+                                 "use quietest region in 450-900 Hz as root")
     root_group.add_argument("--mic", nargs="?", type=parse_positive_float(MAX_RECORD_SECONDS, "--mic"),
                             const=DEFAULT_MIC_SECONDS, default=None, metavar="SECONDS",
                             help=f"record SECONDS (default {DEFAULT_MIC_SECONDS}) of mic audio, "

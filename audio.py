@@ -30,7 +30,6 @@ CLICK_GAP_MS = 85
 CLICK_LEAD_MS = 60
 
 DEFAULT_ROOT_HZ = 440.0
-ROOT_BAND_HZ = 800.0
 MAX_ROOT_HZ = 900.0
 MAX_RECORD_SECONDS = 30.0
 MUSIC_CONFIDENCE_THRESHOLD = 0.35
@@ -270,7 +269,7 @@ def detect_quiet_region(buffer, sample_rate):
     return detect_quiet_freq(buffer, sample_rate), "marimba", "quietest region"
 
 
-def detect_quiet_freq(buffer, sample_rate, band=(ROOT_BAND_HZ / 2, ROOT_BAND_HZ), smooth_hz=QUIET_SMOOTH_HZ, quiet=False):
+def detect_quiet_freq(buffer, sample_rate, band=(MAX_ROOT_HZ / 2, MAX_ROOT_HZ), smooth_hz=QUIET_SMOOTH_HZ, quiet=False):
     windowed = buffer * np.hanning(len(buffer))
     mag = np.abs(np.fft.rfft(windowed))
     freqs = np.fft.rfftfreq(len(buffer), 1 / sample_rate)

@@ -91,8 +91,8 @@ class AudioDspTest(unittest.TestCase):
         t = np.arange(audio.SAMPLE_RATE) / audio.SAMPLE_RATE
         tone = (np.sin(2 * np.pi * 500.0 * t) + 0.01 * np.sin(2 * np.pi * 700.0 * t)).astype(np.float32)
         freq = audio.detect_quiet_freq(tone, audio.SAMPLE_RATE)
-        self.assertGreater(freq, 400.0)
-        self.assertLessEqual(freq, 800.0)
+        self.assertGreater(freq, audio.MAX_ROOT_HZ / 2)
+        self.assertLessEqual(freq, audio.MAX_ROOT_HZ)
         self.assertGreater(abs(freq - 500.0), 50.0)
 
     def test_analyze_mic_short_buffer(self):
