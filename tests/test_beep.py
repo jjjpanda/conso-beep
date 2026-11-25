@@ -1,5 +1,6 @@
 import contextlib
 import http.client
+import http.server
 import io
 import json
 import pathlib
@@ -239,8 +240,10 @@ class AudioDspTest(unittest.TestCase):
 
 class DaemonHttpTest(unittest.TestCase):
     @contextlib.contextmanager
-    def running_daemon(self):
+    def running_daemon(self, play_errors=()):
         played = []
+        play_errors = list(play_errors)
+        self.spatial_calls = []
         played_event = threading.Event()
         ready = threading.Event()
         ports = []
@@ -257,8 +260,15 @@ class DaemonHttpTest(unittest.TestCase):
                 pass
 
         def fake_play(data, sr, latency=None):
+            if play_errors:
+                raise play_errors.pop(0)
             played.append(data)
             played_event.set()
+
+        def fake_spatial(req):
+            placement = (req.pan or 0.0, req.muffle or 0.0, req.ticks or 0)
+            self.spatial_calls.append((placement, list(req.notes)))
+            return placement
 
         with mock.patch.object(daemon.sd, "InputStream", return_value=FakeStream(), create=True), \
                 mock.patch.object(audio.sd, "InputStream", return_value=FakeStream()), \
@@ -267,7 +277,7 @@ class DaemonHttpTest(unittest.TestCase):
                 mock.patch.object(audio, "supports_stereo_output", return_value=True):
             t = threading.Thread(
                 target=daemon.serve,
-                args=(args, parser.parse_args, lambda req: (0.0, 0.0, 0), beep.MELODIES),
+                args=(args, parser.parse_args, fake_spatial, beep.MELODIES),
                 kwargs={"port": 0, "ready_event": ready, "bound_port_out": ports},
                 daemon=True,
             )
@@ -450,6 +460,53 @@ class DaemonHttpTest(unittest.TestCase):
             self.daemon_thread.join(timeout=3.0)
             self.assertFalse(self.daemon_thread.is_alive())
 
+    def test_dashboard_play_spatial_reaches_playback(self):
+        with self.running_daemon() as (port, _token, _played, played_event):
+            st, _ = self._http(
+                "POST", port, "/api/play",
+                {"notes": "0,0.8,50", "use_mic": False, "pan": -0.5, "muffle": 0.7, "ticks": 2},
+            )
+            self.assertEqual(st, 200)
+            self.assertTrue(played_event.wait(timeout=2.0))
+            self.assertEqual(self.spatial_calls[-1][0], (-0.5, 0.7, 2))
+
+    def test_permission_request_plays_permission_melody(self):
+        expected = [beep.parse_note(m) for m in beep.MELODIES["permission"]]
+        with self.running_daemon() as (port, _token, played, played_event):
+            st, _ = beep.http_post_json(
+                "/api/permissions",
+                {"title": "Melody test", "timeout": 0.3, "root_flags": ["--root", "440"], "pan": 0.4, "muffle": 0.2, "ticks": 1},
+                port=port,
+                timeout=2.0,
+            )
+            self.assertEqual(st, 200)
+            self.assertTrue(played_event.wait(timeout=2.0))
+            self.assertEqual(len(played), 1)
+            self.assertEqual(self.spatial_calls[-1], ((0.4, 0.2, 1), expected))
+
+    def test_port_audio_error_reinitializes_and_retries(self):
+        with mock.patch.object(daemon.sd, "_terminate") as term, mock.patch.object(daemon.sd, "_initialize") as init, \
+                self.running_daemon(play_errors=[daemon.sd.PortAudioError("device lost")]) as (port, _token, played, played_event):
+            self.assertTrue(beep.send_to_daemon(["--root", "440", "--", "0,0.8,50"], port=port))
+            self.assertTrue(played_event.wait(timeout=2.0))
+            self.assertEqual(len(played), 1)
+            term.assert_called_once()
+            init.assert_called_once()
+
+    def test_bind_failure_plays_in_process(self):
+        parser = beep.build_arg_parser()
+        args = parser.parse_args(["--listen", "--root", "440", "--", "0,0.8,50"])
+        holder = daemon._DaemonHTTPServer(("127.0.0.1", 0), http.server.BaseHTTPRequestHandler)
+        try:
+            with mock.patch.object(audio, "play_notes") as play:
+                rc = daemon.serve(args, parser.parse_args, lambda req: (0.25, 0.0, 0), beep.MELODIES, port=holder.server_port)
+        finally:
+            holder.server_close()
+        self.assertEqual(rc, 0)
+        play.assert_called_once()
+        self.assertEqual(play.call_args.args[2], args.notes)
+        self.assertEqual(play.call_args.args[3:6], (0.25, 0.0, 0))
+
     def test_permission_timeout_and_security(self):
         with self.running_daemon() as (port, token, _played, _played_event):
             st, body = beep.http_post_json(
@@ -482,6 +539,23 @@ class DaemonHttpTest(unittest.TestCase):
             resp.read()
             conn.close()
             self.assertEqual(resp.status, 413)
+
+
+class DispatchPlayTest(unittest.TestCase):
+    def test_fallback_spawns_listener_when_daemon_unavailable(self):
+        args = beep.build_arg_parser().parse_args(["--root", "440", "--", "0,0.8,50"])
+        placement = (0.5, 0.0, 0)
+        expected = ["--listen", *beep.play_argv(args, placement, args.notes)]
+        for status in (None, 500):
+            with mock.patch.object(beep, "http_post_json", return_value=(status, None)), \
+                    mock.patch.object(beep, "spawn_detached") as spawn:
+                beep.dispatch_play(args, placement, args.notes)
+            spawn.assert_called_once_with(expected)
+
+        with mock.patch.object(beep, "http_post_json", return_value=(200, {"ok": True})), \
+                mock.patch.object(beep, "spawn_detached") as spawn:
+            beep.dispatch_play(args, placement, args.notes)
+        spawn.assert_not_called()
 
 
 class SpatialTest(unittest.TestCase):
