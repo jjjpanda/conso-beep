@@ -24,7 +24,7 @@ AMBIENT_FRAME_S = 0.05
 AMBIENT_PERCENTILE = 50
 TICK_HZ = 2200.0
 TICK_VOL = 1.0
-TICK_MS = 8
+TICK_MS = 12
 LOW_CUT_HZ = 500.0
 CLICK_GAP_MS = 85
 CLICK_LEAD_MS = 60
@@ -362,7 +362,8 @@ def play_notes(root_hz, gain, notes, pan=0.0, muffle=0.0, ticks=0, wait=True, ti
     audio /= max(np.abs(audio).max(), 1e-9)
     if ticks:
         tick_s = TICK_MS / 1000
-        tick = TICK_VOL * bell(TICK_HZ, int(SAMPLE_RATE * tick_s), ((1, 1.0, tick_s / 5),), tick_s / 6)
+        tick = bell(TICK_HZ, int(SAMPLE_RATE * tick_s), ((1, 1.0, tick_s / 3),), tick_s / 6)
+        tick *= TICK_VOL / max(np.abs(tick).max(), 1e-9)
         click = np.concatenate([tick, silence(CLICK_GAP_MS)] * ticks
                                + [silence(CLICK_LEAD_MS)])
         audio = np.concatenate([np.column_stack((click, click)), audio])
