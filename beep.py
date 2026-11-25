@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """Usage: beep.py [--root HZ|NOTE | --auto-key [SECONDS] | --avoid-speech [SECONDS] | --mic [SECONDS]] [--pan PAN] [--muffle MUFFLE] [--ticks N] [--verbose] [--sync] [--melody NAME | -- semitones,vol,ms ...]
+       beep.py --ask TITLE [--detail TEXT] [--source NAME] [--ask-timeout SECONDS] [--melody NAME] [--mic [SECONDS]]
+       beep.py --alert TITLE [--detail TEXT] [--source NAME] [--melody NAME] [--mic [SECONDS]]
        beep.py --listen
   semitones: signed offset from root (0 = root note), -48 to 48
   vol:       0.0-1.0; 0 is a rest
   ms:        time until the next note in milliseconds, 0-10000; notes ring past it
 
   --root         Hz number (523.25) or note name (C5, F#4, Bb3). Default: 440 (A4). Max 20000.
-                 Folded by octaves into 400-800 Hz
-  --auto-key     record SECONDS (default 2) of mic audio, use detected key's root (relative major for minor keys)
-  --avoid-speech record SECONDS (default 1.5) of mic audio, use quietest region in 400-800 Hz as root
+                 Folded by octaves into 450-900 Hz
+  --auto-key     record SECONDS (default 2) of mic audio, use detected key signature's root
+  --avoid-speech record SECONDS (default 1.5) of mic audio, use quietest region in 450-900 Hz as root
   --mic          record SECONDS (default 2) of mic audio, auto-detect music vs talking
                  (by key-detection confidence) and pick --auto-key or --avoid-speech behavior.
                  Mic modes also scale volume to background loudness
@@ -18,9 +20,12 @@
   --verbose      log resolved spatial settings to stderr
   --sync         play audio synchronously in-process (with stderr logs) instead of via daemon
   --melody       play a named melody from MELODIES (done, fail, tool-fail, permission, question, idle, auth, alert)
-  --listen       run the daemon: play requests sent on localhost sequentially, with mic modes
-                 read from a rolling mic buffer. Requests start it on demand; it exits
-                 after 10 idle minutes
+  --ask          send a permission prompt to http://127.0.0.1:47392 and print the JSON decision
+  --alert        show a dismiss-only alert (default melody: alert) in the dashboard; does not wait
+  --detail       optional detail text shown with --ask or --alert in the dashboard
+  --source       optional source label shown with --ask or --alert in the dashboard
+  --ask-timeout  seconds to wait for a dashboard decision (default 120, max 600)
+  --listen       run the HTTP dashboard & rolling-buffer mic daemon on http://127.0.0.1:47392
 
 Mic recording is capped at 30 seconds. Without a mic mode, volume is 0.25.
 
@@ -35,10 +40,13 @@ import re
 import socket
 import subprocess
 import sys
+import time
 
 DEFAULT_AUTO_KEY_SECONDS = 2.0
 DEFAULT_AVOID_SPEECH_SECONDS = 1.5
 DEFAULT_MIC_SECONDS = 2.0
+DEFAULT_ASK_TIMEOUT_SECONDS = 120.0
+MAX_ASK_TIMEOUT_SECONDS = 600.0
 MAX_ROOT_HZ = 20000.0
 MAX_RECORD_SECONDS = 30.0
 NOTE_LIMITS = ((-48.0, 48.0, "semitones"), (0.0, 1.0, "vol"), (0.0, 10000.0, "ms"))
@@ -52,8 +60,8 @@ MELODIES: dict[str, tuple[str, ...]] = {
     "done": ("0,0.9,99",),
     "fail": ("0,0.9,110", "-3,0.95,110", "-6,1,185"),
     "tool-fail": ("5,0.7,90", "-1,0.7,220"),
-    "permission": ("0,1,90", "7,1,120", "9,1,90", "14,1,160"),
-    "question": ("4,1,80", "6,1,80", "2,1,80", "7,1,90", "11,1,260"),
+    "permission": ("0,0.8,85", "7,0.9,95", "11,0.95,115", "14,1,190"),
+    "question": ("2,0.85,95", "7,0.95,120", "11,1,190"),
     "idle": ("0,0.9,72", "0,0.9,110", "-5,0.95,72"),
     "auth": ("0,1,60", "4,1,60", "7,1,60", "12,1,60", "16,1,240"),
     "alert": ("6,1,110", "1,1,110", "6,1,260"),
@@ -136,11 +144,11 @@ def build_arg_parser():
     root_group.add_argument("--auto-key", nargs="?", type=parse_positive_float(MAX_RECORD_SECONDS, "--auto-key"),
                             const=DEFAULT_AUTO_KEY_SECONDS, default=None, metavar="SECONDS",
                             help=f"record SECONDS (default {DEFAULT_AUTO_KEY_SECONDS}) of mic audio, "
-                                 "use detected key's root (relative major for minor keys)")
+                                 "use detected key signature's root")
     root_group.add_argument("--avoid-speech", nargs="?", type=parse_positive_float(MAX_RECORD_SECONDS, "--avoid-speech"),
                             const=DEFAULT_AVOID_SPEECH_SECONDS, default=None, metavar="SECONDS",
                             help=f"record SECONDS (default {DEFAULT_AVOID_SPEECH_SECONDS}) of mic audio, "
-                                 "use quietest region in 400-800 Hz as root")
+                                 "use quietest region in 450-900 Hz as root")
     root_group.add_argument("--mic", nargs="?", type=parse_positive_float(MAX_RECORD_SECONDS, "--mic"),
                             const=DEFAULT_MIC_SECONDS, default=None, metavar="SECONDS",
                             help=f"record SECONDS (default {DEFAULT_MIC_SECONDS}) of mic audio, "
@@ -157,8 +165,19 @@ def build_arg_parser():
                         help="play audio synchronously in-process (with stderr logs) instead of via daemon")
     parser.add_argument("--melody", choices=MELODIES, default=None,
                         help="play a named melody instead of positional notes")
+    parser.add_argument("--ask", default=None, metavar="TITLE",
+                        help="send a permission request to the daemon dashboard and print JSON decision")
+    parser.add_argument("--alert", default=None, metavar="TITLE",
+                        help="show a dismiss-only alert in the daemon dashboard and return at once")
+    parser.add_argument("--detail", default="",
+                        help="optional detail text shown with --ask or --alert")
+    parser.add_argument("--source", default="",
+                        help="optional source label shown with --ask or --alert")
+    parser.add_argument("--ask-timeout", type=parse_positive_float(MAX_ASK_TIMEOUT_SECONDS, "--ask-timeout"),
+                        default=DEFAULT_ASK_TIMEOUT_SECONDS, metavar="SECONDS",
+                        help=f"seconds to wait for dashboard decision (default {DEFAULT_ASK_TIMEOUT_SECONDS:g})")
     parser.add_argument("--listen", action="store_true",
-                        help="run the background mic daemon that plays requests from a rolling mic buffer")
+                        help="run the HTTP dashboard and rolling-buffer mic daemon")
     parser.add_argument("notes", nargs="*", type=parse_note, metavar="semitones,vol,ms")
     return parser
 
@@ -178,15 +197,54 @@ def resolve_spatial(args, cwd=None):
     return pan, muffle, ticks
 
 
-def send_to_daemon(argv, port=DAEMON_PORT):
+def daemon_reachable(port=DAEMON_PORT, timeout=DAEMON_TIMEOUT_S):
     try:
-        with socket.create_connection(("127.0.0.1", port), timeout=DAEMON_TIMEOUT_S) as conn:
-            conn.settimeout(DAEMON_TIMEOUT_S)
-            conn.sendall(json.dumps(argv).encode())
-            conn.shutdown(socket.SHUT_WR)
-            return conn.recv(16).strip() == b"ok"
+        with socket.create_connection(("127.0.0.1", port), timeout=timeout):
+            return True
     except OSError:
         return False
+
+
+def http_post_json(path, payload, port=DAEMON_PORT, timeout=DAEMON_TIMEOUT_S):
+    body = json.dumps(payload).encode("utf-8")
+    req = (
+        f"POST {path} HTTP/1.1\r\n"
+        f"Host: 127.0.0.1:{port}\r\n"
+        "Content-Type: application/json\r\n"
+        f"Content-Length: {len(body)}\r\n"
+        "Connection: close\r\n\r\n"
+    ).encode("ascii") + body
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=timeout) as conn:
+            conn.settimeout(timeout)
+            conn.sendall(req)
+            chunks = []
+            while True:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+    except OSError:
+        return (None, None)
+
+    raw = b"".join(chunks)
+    if b"\r\n\r\n" not in raw:
+        return (None, None)
+    head, resp_body = raw.split(b"\r\n\r\n", 1)
+    try:
+        status = int(head.split(b"\r\n", 1)[0].split()[1])
+    except (IndexError, ValueError):
+        return (None, None)
+    try:
+        parsed = json.loads(resp_body.decode("utf-8")) if resp_body else {}
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        parsed = None
+    return (status, parsed)
+
+
+def send_to_daemon(argv, port=DAEMON_PORT):
+    status, _ = http_post_json("/api/play", {"argv": argv}, port=port, timeout=DAEMON_TIMEOUT_S)
+    return status == 200
 
 
 def build_root_flags(args) -> list[str]:
@@ -226,11 +284,50 @@ def dispatch_play(args, placement, notes, port=DAEMON_PORT):
     if args.sync:
         import audio
 
-        audio.play_notes(*audio.resolve_mic(args), notes, *placement)
+        root_hz, gain, timbre = audio.resolve_mic(args)
+        audio.play_notes(root_hz, gain, notes, *placement, timbre=timbre)
         return
     argv = play_argv(args, placement, notes)
     if not send_to_daemon(argv, port=port):
         spawn_detached(["--listen", *argv])
+
+
+def inbox_payload(args, title, default_melody, port):
+    placement = resolve_spatial(args)
+    if not daemon_reachable(port=port):
+        spawn_detached(["--listen"])
+        deadline = time.monotonic() + 2.5
+        while time.monotonic() < deadline:
+            if daemon_reachable(port=port):
+                break
+            time.sleep(0.05)
+    return {
+        "title": title,
+        "detail": args.detail,
+        "cwd": str(pathlib.Path.cwd()),
+        "source": args.source,
+        "melody": args.melody or default_melody,
+        "root_flags": build_root_flags(args),
+        "pan": placement[0],
+        "muffle": placement[1],
+        "ticks": placement[2],
+    }
+
+
+def run_alert(args, port=DAEMON_PORT):
+    payload = inbox_payload(args, args.alert, "alert", port)
+    status, _ = http_post_json("/api/alerts", payload, port=port, timeout=2.0)
+    return 0 if status == 200 else 1
+
+
+def run_ask(args, port=DAEMON_PORT):
+    payload = {**inbox_payload(args, args.ask, "permission", port), "timeout": args.ask_timeout}
+    status, body = http_post_json("/api/permissions", payload, port=port, timeout=args.ask_timeout + 5.0)
+    if status == 200 and isinstance(body, dict):
+        print(json.dumps(body))
+    else:
+        print(json.dumps({"decision": "timeout", "reason": "daemon unavailable"}))
+    return 0
 
 
 def main(argv=None):
@@ -238,16 +335,25 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.listen and args.sync:
         parser.error("--listen cannot be combined with --sync")
+    if args.ask is not None and args.alert is not None:
+        parser.error("--ask cannot be combined with --alert")
+    for flag, title, run in (("--ask", args.ask, run_ask), ("--alert", args.alert, run_alert)):
+        if title is not None:
+            if args.listen or args.sync or args.notes:
+                parser.error(f"{flag} cannot be combined with --listen, --sync, or positional notes")
+            if not title.strip():
+                parser.error(f"{flag} TITLE must not be empty")
+            return run(args)
     if args.melody:
         if args.notes:
             parser.error("--melody cannot be combined with positional notes")
         args.notes = [parse_note(m) for m in MELODIES[args.melody]]
     if args.listen:
-        import audio
+        import daemon
 
-        return audio.listen(args, parser.parse_args, resolve_spatial)
+        return daemon.serve(args, parser.parse_args, resolve_spatial, MELODIES)
     if not args.notes:
-        parser.error("at least one semitones,vol,ms note is required unless --listen is set")
+        parser.error("at least one semitones,vol,ms note is required unless --listen or --ask is set")
 
     placement = resolve_spatial(args)
     dispatch_play(args, placement, args.notes)

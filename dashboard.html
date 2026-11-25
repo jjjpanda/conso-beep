@@ -1,0 +1,512 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>conso-beep</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #111317;
+      --card: #191c22;
+      --border: #2a2f3a;
+      --text: #e6e9ef;
+      --muted: #8b93a6;
+      --accent: #58a6ff;
+      --ok: #3fb950;
+      --warn: #d29922;
+      --bad: #f85149;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      padding: 20px;
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+    }
+    .wrap { max-width: 980px; margin: 0 auto; display: grid; gap: 16px; }
+    header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+    h1 { margin: 0; font-size: 18px; font-weight: 600; }
+    h2 { margin: 0 0 12px; font-size: 14px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+    .top-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(290px, 1fr)); gap: 16px; }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 16px;
+    }
+    .kv { display: grid; grid-template-columns: 120px 1fr; gap: 8px 12px; font-size: 13px; align-items: center; }
+    .k { color: var(--muted); }
+    .v { font-family: ui-monospace, Consolas, monospace; }
+    .badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 600;
+      background: #252a34;
+      color: var(--muted);
+    }
+    .badge.ok { background: rgba(63, 185, 80, 0.16); color: var(--ok); }
+    .badge.warn { background: rgba(210, 153, 34, 0.18); color: var(--warn); }
+    .badge.bad { background: rgba(248, 81, 73, 0.18); color: var(--bad); }
+    .meter-track {
+      width: 100%;
+      height: 8px;
+      background: #0b0d10;
+      border-radius: 4px;
+      overflow: hidden;
+      margin-top: 4px;
+    }
+    .meter-fill { height: 100%; width: 0%; background: var(--accent); transition: width 0.25s ease; }
+    .row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .controls-stack { display: grid; gap: 12px; }
+    button {
+      border: 1px solid var(--border);
+      background: #222630;
+      color: var(--text);
+      border-radius: 6px;
+      padding: 6px 12px;
+      font-size: 13px;
+      cursor: pointer;
+    }
+    button:hover { border-color: #444c5c; }
+    button.primary { background: rgba(63, 185, 80, 0.18); border-color: rgba(63, 185, 80, 0.45); color: var(--ok); }
+    button.danger { background: rgba(248, 81, 73, 0.16); border-color: rgba(248, 81, 73, 0.45); color: var(--bad); }
+    button.active { background: rgba(88, 166, 255, 0.2); border-color: var(--accent); color: var(--accent); }
+    button:disabled { opacity: 0.45; cursor: not-allowed; }
+    input[type="range"] { flex: 1; min-width: 120px; }
+    input[type="text"], select {
+      padding: 6px 10px;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: #0d0f13;
+      color: var(--text);
+      font-size: 13px;
+    }
+    input[type="text"] {
+      flex: 1;
+      min-width: 200px;
+      font-family: ui-monospace, Consolas, monospace;
+    }
+    label.check { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); cursor: pointer; }
+    .play-status { font-size: 12px; color: var(--muted); min-height: 16px; }
+    .play-status.bad { color: var(--bad); }
+    .inbox-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+    .perm-list { display: grid; gap: 10px; }
+    .perm-item {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 12px;
+      background: #14171c;
+      display: grid;
+      gap: 8px;
+    }
+    .perm-top { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+    .perm-title { font-weight: 600; font-size: 14px; }
+    .perm-meta { font-size: 12px; color: var(--muted); font-family: ui-monospace, Consolas, monospace; word-break: break-all; }
+    pre.perm-detail {
+      margin: 0;
+      padding: 8px 10px;
+      border-radius: 6px;
+      background: #0d0f13;
+      border: 1px solid #222731;
+      font-size: 12px;
+      white-space: pre-wrap;
+      word-break: break-word;
+      max-height: 180px;
+      overflow: auto;
+    }
+    .empty { color: var(--muted); font-size: 13px; padding: 12px 0; }
+    .banner {
+      display: none;
+      padding: 10px 14px;
+      border-radius: 8px;
+      background: rgba(248, 81, 73, 0.16);
+      border: 1px solid rgba(248, 81, 73, 0.45);
+      color: var(--bad);
+      font-size: 13px;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <h1>conso-beep</h1>
+      <span id="connBadge" class="badge">Connecting</span>
+    </header>
+
+    <div id="offlineBanner" class="banner">Daemon disconnected.</div>
+
+    <section class="card">
+      <div class="inbox-head">
+        <div class="row">
+          <h2 style="margin:0;">Pending Permissions</h2>
+          <span id="permCount" class="badge">0</span>
+        </div>
+        <div class="row">
+          <button id="allowAllBtn" class="primary" type="button" disabled>Allow All</button>
+          <button id="denyAllBtn" class="danger" type="button" disabled>Deny All</button>
+        </div>
+      </div>
+      <div id="permList" class="perm-list"></div>
+    </section>
+
+    <section id="alertCard" class="card" style="display:none;">
+      <div class="inbox-head">
+        <div class="row">
+          <h2 style="margin:0;">Alerts</h2>
+          <span id="alertCount" class="badge warn">0</span>
+        </div>
+        <button id="dismissAllBtn" type="button">Dismiss All</button>
+      </div>
+      <div id="alertList" class="perm-list"></div>
+    </section>
+
+    <div class="top-grid">
+      <section class="card">
+        <h2>Live Room Status</h2>
+        <div class="kv">
+          <span class="k">Mic</span>
+          <span><span id="micBadge" class="badge">Idle</span></span>
+          <span class="k">Mode</span>
+          <span id="micMode" class="v">-</span>
+          <span class="k">Ambient</span>
+          <div>
+            <span id="ambientDb" class="v">-</span>
+            <div class="meter-track"><div id="ambientMeter" class="meter-fill"></div></div>
+          </div>
+          <span class="k">Key Sig</span>
+          <span id="micKey" class="v">-</span>
+          <span class="k">Quiet Band</span>
+          <span id="quietHz" class="v">-</span>
+          <span class="k">Root / Gain</span>
+          <span id="rootGain" class="v">-</span>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>Quick Controls</h2>
+        <div class="controls-stack">
+          <div class="row">
+            <button id="muteBtn" type="button">Mute</button>
+            <button id="keepAliveBtn" type="button">Keep Alive</button>
+            <button id="stopBtn" class="danger" type="button">Stop Daemon</button>
+          </div>
+          <div class="row">
+            <span class="k">Gain</span>
+            <input id="gainSlider" type="range" min="0.05" max="1.00" step="0.05" value="0.25">
+            <span id="gainVal" class="v">Auto</span>
+            <button id="gainAutoBtn" type="button">Auto</button>
+          </div>
+          <div class="row">
+            <span class="k">Idle Exit</span>
+            <span id="idleReadout" class="v">-</span>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <section class="card">
+      <div class="inbox-head" style="margin-bottom:10px;">
+        <h2 style="margin:0;">Play</h2>
+        <div class="row">
+          <select id="timbreSelect">
+            <option value="auto">Tone: Auto</option>
+            <option value="sine">Tone: Glassy Sine</option>
+            <option value="marimba">Tone: Woody Marimba</option>
+          </select>
+          <label class="check"><input id="useMicCheck" type="checkbox" checked> Match Room (--mic)</label>
+        </div>
+      </div>
+      <div class="controls-stack">
+        <div class="row">
+          <span class="k">Pan</span>
+          <input id="panSlider" type="range" min="-1" max="1" step="0.1" value="0">
+          <span id="panVal" class="v">0.0</span>
+          <span class="k">Muffle</span>
+          <input id="muffleSlider" type="range" min="0" max="1" step="0.1" value="0">
+          <span id="muffleVal" class="v">0.0</span>
+          <span class="k">Ticks</span>
+          <input id="ticksSlider" type="range" min="0" max="3" step="1" value="0">
+          <span id="ticksVal" class="v">0</span>
+        </div>
+        <div id="melodyBtns" class="row"></div>
+        <form id="customPlayForm" class="row">
+          <input id="notesInput" type="text" placeholder="0,0.9,72 4,1,72 7,1,99" value="0,0.9,72 4,1,72 7,1,99">
+          <button type="submit" class="primary">Play</button>
+        </form>
+        <div id="playStatus" class="play-status"></div>
+      </div>
+    </section>
+  </div>
+
+  <script>
+    const TOKEN = "{{TOKEN}}";
+    let currentIds = [];
+    let currentAlertIds = [];
+    let currentControls = { muted: false, keep_alive: false, gain_override: null };
+    let renderedMelodies = "";
+    let melodyNotes = {};
+
+    async function postJson(path, body) {
+      const res = await fetch(path, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Conso-Token": TOKEN
+        },
+        body: JSON.stringify(body)
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || String(res.status));
+      return data;
+    }
+
+    async function triggerPlay(payload, label) {
+      const status = document.getElementById("playStatus");
+      status.className = "play-status";
+      try {
+        const res = await postJson("/api/play", {
+          ...payload,
+          use_mic: document.getElementById("useMicCheck").checked,
+          timbre: document.getElementById("timbreSelect").value,
+          pan: Number(document.getElementById("panSlider").value),
+          muffle: Number(document.getElementById("muffleSlider").value),
+          ticks: Number(document.getElementById("ticksSlider").value)
+        });
+        status.textContent = res.muted ? "Muted (unmute to hear audio)." : "Played " + label + ".";
+      } catch (err) {
+        status.className = "play-status bad";
+        status.textContent = "Play error: " + err.message;
+      }
+    }
+
+    function renderMelodies(melodies, notesMap) {
+      melodyNotes = notesMap || {};
+      const key = (melodies || []).join(",");
+      if (key === renderedMelodies) return;
+      renderedMelodies = key;
+      const box = document.getElementById("melodyBtns");
+      box.textContent = "";
+      for (const name of melodies || []) {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.textContent = name;
+        btn.onclick = () => {
+          if (melodyNotes[name]) {
+            document.getElementById("notesInput").value = melodyNotes[name];
+          }
+          triggerPlay({ melody: name }, name);
+        };
+        box.appendChild(btn);
+      }
+    }
+
+    function renderMic(mic) {
+      const badge = document.getElementById("micBadge");
+      badge.textContent = mic.active ? "Active" : "Idle";
+      badge.className = mic.active ? "badge ok" : "badge";
+      document.getElementById("micMode").textContent = mic.mode || "-";
+      const dbText = mic.ambient_db == null ? "-" : mic.ambient_db.toFixed(1) + " dBFS";
+      document.getElementById("ambientDb").textContent = dbText;
+      const pct = mic.ambient_db == null ? 0 : Math.max(0, Math.min(100, ((mic.ambient_db + 65) / 50) * 100));
+      document.getElementById("ambientMeter").style.width = pct.toFixed(1) + "%";
+      const keyText = mic.key ? mic.key + " (" + Number(mic.key_confidence || 0).toFixed(2) + ")" : "-";
+      document.getElementById("micKey").textContent = keyText;
+      document.getElementById("quietHz").textContent = mic.quiet_hz == null ? "-" : mic.quiet_hz.toFixed(1) + " Hz";
+      const rootText = mic.root_hz == null ? "-" : mic.root_hz.toFixed(2) + " Hz";
+      const gainText = mic.gain == null ? "-" : Number(mic.gain).toFixed(2);
+      document.getElementById("rootGain").textContent = rootText + " / " + gainText;
+    }
+
+    function renderControls(ctrl) {
+      currentControls = ctrl;
+      const muteBtn = document.getElementById("muteBtn");
+      muteBtn.textContent = ctrl.muted ? "Muted" : "Mute";
+      muteBtn.className = ctrl.muted ? "active" : "";
+
+      const keepBtn = document.getElementById("keepAliveBtn");
+      keepBtn.textContent = ctrl.keep_alive ? "Keep Alive: On" : "Keep Alive: Off";
+      keepBtn.className = ctrl.keep_alive ? "active" : "";
+
+      const slider = document.getElementById("gainSlider");
+      const gainVal = document.getElementById("gainVal");
+      if (ctrl.gain_override == null) {
+        gainVal.textContent = "Auto";
+      } else {
+        slider.value = String(ctrl.gain_override);
+        gainVal.textContent = Number(ctrl.gain_override).toFixed(2);
+      }
+
+      const idle = document.getElementById("idleReadout");
+      if (ctrl.keep_alive) {
+        idle.textContent = "Pinned";
+      } else if (ctrl.idle_remaining_s == null) {
+        idle.textContent = "Paused (pending)";
+      } else {
+        const m = Math.floor(ctrl.idle_remaining_s / 60);
+        const s = ctrl.idle_remaining_s % 60;
+        idle.textContent = m + "m " + String(s).padStart(2, "0") + "s";
+      }
+    }
+
+    function renderPermissions(perms) {
+      currentIds = perms.map((p) => p.id);
+      const countBadge = document.getElementById("permCount");
+      countBadge.textContent = String(perms.length);
+      countBadge.className = perms.length ? "badge warn" : "badge";
+      document.getElementById("allowAllBtn").disabled = perms.length === 0;
+      document.getElementById("denyAllBtn").disabled = perms.length === 0;
+
+      const list = document.getElementById("permList");
+      list.textContent = "";
+      if (perms.length === 0) {
+        const empty = document.createElement("div");
+        empty.className = "empty";
+        empty.textContent = "No pending permission requests.";
+        list.appendChild(empty);
+        return;
+      }
+
+      for (const p of perms) {
+        list.appendChild(inboxItem(p, [
+          ["Allow", "primary", () => postJson("/api/permissions/decide", { ids: [p.id], decision: "allow" })],
+          ["Deny", "danger", () => postJson("/api/permissions/decide", { ids: [p.id], decision: "deny" })]
+        ]));
+      }
+    }
+
+    function inboxItem(p, buttons) {
+      const item = document.createElement("div");
+      item.className = "perm-item";
+
+      const top = document.createElement("div");
+      top.className = "perm-top";
+
+      const title = document.createElement("div");
+      title.className = "perm-title";
+      title.textContent = p.title;
+      top.appendChild(title);
+
+      const actions = document.createElement("div");
+      actions.className = "row";
+      for (const [label, cls, action] of buttons) {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = cls;
+        btn.textContent = label;
+        btn.onclick = async () => {
+          await action();
+          refresh();
+        };
+        actions.appendChild(btn);
+      }
+      top.appendChild(actions);
+      item.appendChild(top);
+
+      const age = Math.max(0, Math.round(Date.now() / 1000 - p.created_at));
+      const metaParts = [p.source || "cli", age + "s ago"];
+      if (p.cwd) metaParts.push(p.cwd);
+      const meta = document.createElement("div");
+      meta.className = "perm-meta";
+      meta.textContent = metaParts.join(" · ");
+      item.appendChild(meta);
+
+      if (p.detail) {
+        const pre = document.createElement("pre");
+        pre.className = "perm-detail";
+        pre.textContent = p.detail;
+        item.appendChild(pre);
+      }
+      return item;
+    }
+
+    function renderAlerts(alerts) {
+      currentAlertIds = alerts.map((a) => a.id);
+      document.getElementById("alertCard").style.display = alerts.length ? "" : "none";
+      document.getElementById("alertCount").textContent = String(alerts.length);
+      const list = document.getElementById("alertList");
+      list.textContent = "";
+      for (const a of alerts) {
+        list.appendChild(inboxItem(a, [["Dismiss", "", () => postJson("/api/alerts/dismiss", { ids: [a.id] })]]));
+      }
+    }
+
+    async function refresh() {
+      const conn = document.getElementById("connBadge");
+      const banner = document.getElementById("offlineBanner");
+      try {
+        const res = await fetch("/api/status", { cache: "no-store" });
+        if (!res.ok) throw new Error(String(res.status));
+        const data = await res.json();
+        conn.textContent = "Connected";
+        conn.className = "badge ok";
+        banner.style.display = "none";
+        renderMelodies(data.melodies, data.melody_notes);
+        renderMic(data.mic);
+        renderControls(data.controls);
+        renderPermissions(data.permissions);
+        renderAlerts(data.alerts || []);
+      } catch (_err) {
+        conn.textContent = "Disconnected";
+        conn.className = "badge bad";
+        banner.style.display = "block";
+      }
+    }
+
+    for (const [id, digits] of [["pan", 1], ["muffle", 1], ["ticks", 0]]) {
+      document.getElementById(id + "Slider").oninput = (e) => {
+        document.getElementById(id + "Val").textContent = Number(e.target.value).toFixed(digits);
+      };
+    }
+    document.getElementById("customPlayForm").onsubmit = (e) => {
+      e.preventDefault();
+      triggerPlay({ notes: document.getElementById("notesInput").value }, "custom notes");
+    };
+    document.getElementById("muteBtn").onclick = async () => {
+      await postJson("/api/controls", { muted: !currentControls.muted });
+      refresh();
+    };
+    document.getElementById("keepAliveBtn").onclick = async () => {
+      await postJson("/api/controls", { keep_alive: !currentControls.keep_alive });
+      refresh();
+    };
+    document.getElementById("gainSlider").onchange = async (e) => {
+      await postJson("/api/controls", { gain_override: Number(e.target.value) });
+      refresh();
+    };
+    document.getElementById("gainAutoBtn").onclick = async () => {
+      await postJson("/api/controls", { gain_override: null });
+      refresh();
+    };
+    document.getElementById("stopBtn").onclick = async () => {
+      await postJson("/api/stop", {});
+      refresh();
+    };
+    document.getElementById("allowAllBtn").onclick = async () => {
+      if (currentIds.length) {
+        await postJson("/api/permissions/decide", { ids: currentIds, decision: "allow" });
+        refresh();
+      }
+    };
+    document.getElementById("denyAllBtn").onclick = async () => {
+      if (currentIds.length) {
+        await postJson("/api/permissions/decide", { ids: currentIds, decision: "deny" });
+        refresh();
+      }
+    };
+
+    document.getElementById("dismissAllBtn").onclick = async () => {
+      if (currentAlertIds.length) {
+        await postJson("/api/alerts/dismiss", { ids: currentAlertIds });
+        refresh();
+      }
+    };
+
+    refresh();
+    setInterval(refresh, 1000);
+  </script>
+</body>
+</html>

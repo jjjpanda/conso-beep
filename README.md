@@ -1,6 +1,6 @@
 # conso-beep
 
-Ambient-aware audio tones for CLI and background notifications. Flags are in the `beep.py` docstring.
+Ambient-aware audio tones, live mic dashboard, and permission inbox. Flags are in the `beep.py` docstring.
 
 ## Install
 
@@ -12,15 +12,20 @@ pip install sounddevice numpy
 
 ## Layout
 
-- `beep.py` — stdlib-only CLI and daemon client (`python -S` fast path).
-- `audio.py` — DSP bell synthesis, mic analysis, and rolling-buffer daemon (`--listen`).
+- `beep.py` — stdlib-only CLI, `--ask` client, and daemon dispatcher (`python -S` fast path).
+- `audio.py` — DSP bell synthesis, mic analysis, and rolling `MicRing` telemetry.
+- `daemon.py` — localhost HTTP server (`http://127.0.0.1:47392`), playback worker, and permission inbox.
+- `dashboard.html` — permission inbox (top), live room status, quick controls, and a play panel with tone, pan, muffle, and ticks.
 - `spatial.py` — Windows monitor panning and virtual-desktop muffling/ticks.
+- `tests/` — `unittest` suite (`python -m unittest discover -s tests -v`).
 
 ## How it works
 
-- Requests send their melody to the background daemon on `127.0.0.1:47392`, starting it on demand (`--listen`). The daemon exits after 10 idle minutes. Pass `--sync` to play in-process with stderr logs.
+- Requests send their melody to the background HTTP daemon on `http://127.0.0.1:47392`, starting it on demand (`--listen`). The daemon exits after 10 idle minutes unless `Keep Alive` is toggled in the dashboard. Pass `--sync` to play in-process with stderr logs.
 - `--melody NAME` plays a built-in tone (`done`, `fail`, `tool-fail`, `permission`, `question`, `idle`, `auth`, `alert`).
-- `--mic` matches pitch (or avoids speech in `400-800 Hz`) and scales volume to room loudness.
+- `--ask TITLE` posts a permission request to the dashboard inbox, plays the `permission` melody (or the `--melody` choice), and prints `{"decision": "allow"|"deny"|"timeout", "reason": "..."}` once resolved.
+- `--alert TITLE` shows a dismiss-only alert in the dashboard (for questions or notices), plays the `alert` melody (or the `--melody` choice), and returns at once.
+- `--mic` matches pitch (or avoids speech in `450-900 Hz`) and scales volume to room loudness. After the first mic-mode request, the daemon keeps the microphone open until it exits (indefinitely with `Keep Alive` on).
 - On Windows, the beep pans toward the active window's monitor. Beeps from other virtual desktops sound muffled, with one tick per desktop away.
 
 ## CLI
@@ -28,4 +33,5 @@ pip install sounddevice numpy
 ```bash
 python beep.py --root C5 -- 0,0.4,55 4,0.5,55 7,0.55,80
 python -S beep.py --mic --melody done
+python -S beep.py --ask "Run tests?" --detail "pytest -q" --source cli
 ```
