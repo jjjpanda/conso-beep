@@ -1,10 +1,8 @@
 # conso-beep
 
-Ambient-aware tone generator and lifecycle hook runner for LLM agent harnesses.
+Ambient-aware beeps for LLM agent harness hooks. Flags are in the `beep.py` docstring.
 
-See the module docstring at the top of `beep.py` for CLI flags, options, and defaults.
-
-## Dependencies
+## Install
 
 Python 3.10+.
 
@@ -12,22 +10,17 @@ Python 3.10+.
 pip install sounddevice numpy
 ```
 
-## Usage
+Point the harness hooks at `python -S <path>/beep.py --hook --mic`, or clone the repo into the harness plugin folder (`plugin.json` and `hooks.json` are the manifest).
 
-**Direct CLI:**
+## How it works
+
+- `--hook` reads hook JSON from `stdin`, prints hook JSON to `stdout`, and sends the event's melody to a background daemon. It starts the daemon if none runs. The daemon exits after 10 idle minutes.
+- `-S` makes the hook start fast. `--sync` plays in-process instead, and needs plain `python`.
+- `--mic` matches pitch and volume to the room.
+- On Windows, the beep pans toward the source monitor. Beeps from other virtual desktops sound muffled, with one pluck per desktop away.
+
+## CLI
 
 ```bash
 python beep.py --root C5 -- 0,0.4,55 4,0.5,55 7,0.55,80
 ```
-
-On Windows, the beep pans toward the monitor or virtual desktop it came from. Beeps from other desktops sound muffled, with one pluck per desktop away.
-
-**Hook runner (`--hook`):**
-
-Reads hook JSON from `stdin`, plays the melody for that event in a detached process, and prints valid hook JSON to `stdout`. Pass `--sync` to block until playback finishes.
-
-## Installation
-
-Point the harness lifecycle hooks at `python <path>/beep.py --hook --mic`. For harnesses that load plugins from a folder, clone the repo there; `plugin.json` and `hooks.json` are the manifest.
-
-`--mic` picks a pitch that fits the room and a volume that fits its background noise. The first call starts a background mic daemon (`--listen`) and records for 2 seconds. Later calls read the daemon's rolling buffer and play at once. The daemon exits after 10 idle minutes.

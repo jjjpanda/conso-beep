@@ -20,9 +20,9 @@
                  melody, and emit hook JSON to stdout
   --sync         play audio synchronously in --hook mode instead of spawning detached
   --melody       play a named melody from HOOK_MELODIES (e.g. Stop, Notification:idle_prompt)
-  --listen       run the mic daemon: keep a rolling mic buffer and answer mic-mode
-                 root queries on localhost so beeps need not record first. Mic modes
-                 start it on demand; it exits after 10 idle minutes
+  --listen       run the daemon: play requests sent on localhost at once, with mic modes
+                 read from a rolling mic buffer. Hooks start it on demand; it exits
+                 after 10 idle minutes
 
 Mic recording is capped at 30 seconds. Without a mic mode, volume is 0.5.
 
@@ -52,12 +52,12 @@ STUTTER_SPACING_S = 0.039
 STUTTER_LEVEL = 0.5
 STUTTER_DECAY_S = 0.008
 AMBIENT_DB = (-55.0, -25.0)
-AMBIENT_GAIN = (0.27, 0.8)
-DEFAULT_GAIN = 0.27
+AMBIENT_GAIN = (0.5, 1.0)
+DEFAULT_GAIN = 0.5
 AMBIENT_FRAME_S = 0.05
-AMBIENT_PERCENTILE = 30
-TICK_VOL = 0.5
-TICK_MS = 30
+AMBIENT_PERCENTILE = 50
+TICK_VOL = 1.0
+TICK_MS = 60
 CLICK_GAP_MS = 85
 CLICK_LEAD_MS = 60
 
@@ -73,9 +73,10 @@ MUSIC_CONFIDENCE_THRESHOLD = 0.55
 CHROMA_FMIN, CHROMA_FMAX = 65.0, 2100.0
 QUIET_BAND = (200.0, 4000.0)
 QUIET_SMOOTH_HZ = 30.0
-DAEMON_PORT = 47391
+DAEMON_PORT = 47392
 DAEMON_IDLE_S = 600
 DAEMON_TIMEOUT_S = 0.25
+DAEMON_MIN_MIC_S = 0.5
 
 PITCH_CLASSES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 NOTE_LETTER_SEMITONES = {"C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11}
@@ -426,22 +427,18 @@ def resolve_spatial(args, cwd=None):
     return pan, muffle, ticks
 
 
-def query_daemon(flag, seconds):
+def send_to_daemon(argv):
     import socket
 
     try:
         with socket.create_connection(("127.0.0.1", DAEMON_PORT), timeout=DAEMON_TIMEOUT_S) as conn:
-            conn.sendall(f"{flag} {seconds}".encode())
-            hz, gain, what = conn.recv(256).decode().split(" ", 2)
-            return float(hz), float(gain), f"{what}, cached"
+            conn.sendall(json.dumps(argv).encode())
+        return True
     except OSError:
-        spawn_detached(["--listen"])
-    except ValueError:
-        pass
-    return None
+        return False
 
 
-def listen():
+def listen(args):
     import socket
 
     server = socket.socket()
@@ -450,6 +447,8 @@ def listen():
     try:
         server.bind(("127.0.0.1", DAEMON_PORT))
     except OSError:
+        if args.notes:
+            play_notes(*resolve_mic(args), args.notes, *resolve_spatial(args))
         return 0
     server.listen()
     server.settimeout(DAEMON_IDLE_S)
@@ -459,7 +458,7 @@ def listen():
     import sounddevice as sd
 
     ring = np.zeros(int(MAX_RECORD_SECONDS * SAMPLE_RATE), dtype=np.float32)
-    state = {"pos": 0, "filled": 0}
+    state = {"pos": 0, "filled": 0, "stream": None}
     lock = threading.Lock()
 
     def on_audio(indata, frames, _time, _status):
@@ -468,40 +467,49 @@ def listen():
             state["pos"] = (state["pos"] + frames) % len(ring)
             state["filled"] = min(len(ring), state["filled"] + frames)
 
-    def latest(n):
+    def recent(seconds):
+        if state["stream"] is None:
+            try:
+                state["stream"] = sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32", callback=on_audio)
+                state["stream"].start()
+            except sd.PortAudioError:
+                return None
         with lock:
-            return np.roll(ring, -state["pos"])[-n:] if 0 < n <= state["filled"] else None
+            n = min(int(seconds * SAMPLE_RATE), state["filled"])
+            return np.roll(ring, -state["pos"])[-n:] if n >= DAEMON_MIN_MIC_S * SAMPLE_RATE else None
 
-    with server, sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32", callback=on_audio):
+    def serve(request):
+        if request.notes:
+            play_notes(*resolve_mic(request, recent), request.notes, *resolve_spatial(request), wait=False)
+
+    parser = build_arg_parser()
+    with server:
+        serve(args)
         while True:
             try:
                 conn, _ = server.accept()
             except TimeoutError:
-                return 0
+                break
             with conn:
                 try:
                     conn.settimeout(DAEMON_TIMEOUT_S)
-                    flag, seconds = conn.recv(64).decode().split()
-                    buf = latest(int(float(seconds) * SAMPLE_RATE))
-                    if buf is not None:
-                        root_hz, gain, what = analyze_mic(flag, buf)
-                        conn.sendall(f"{root_hz} {gain} {what}".encode())
-                except (OSError, ValueError, OverflowError, KeyError):
-                    pass
+                    serve(parser.parse_args(json.loads(b"".join(iter(lambda: conn.recv(4096), b"")))))
+                except (Exception, SystemExit) as e:
+                    print(f"[beep] daemon error: {e!r}", file=sys.stderr)
+    if state["stream"] is not None:
+        state["stream"].close()
+    return 0
 
 
-def resolve_mic(args):
+def resolve_mic(args, source=record_audio):
     mic_modes = (("--auto-key", args.auto_key), ("--avoid-speech", args.avoid_speech), ("--mic", args.mic))
     for flag, seconds in mic_modes:
         if seconds is None:
             continue
         if seconds <= 0:
             raise SystemExit(f"{flag} SECONDS must be > 0")
-        result = query_daemon(flag, seconds)
-        if result is None:
-            buf = record_audio(seconds)
-            result = (DEFAULT_ROOT_HZ, DEFAULT_GAIN, "default (no mic)") if buf is None else analyze_mic(flag, buf)
-        root_hz, gain, what = result
+        buf = source(seconds)
+        root_hz, gain, what = (DEFAULT_ROOT_HZ, DEFAULT_GAIN, "default (no mic)") if buf is None else analyze_mic(flag, buf)
         desc = f"{what} ({flag} {seconds:.1f}s)"
         break
     else:
@@ -513,7 +521,7 @@ def resolve_mic(args):
     return root_hz, gain
 
 
-def play_notes(root_hz, gain, notes, pan=0.0, muffle=0.0, ticks=0):
+def play_notes(root_hz, gain, notes, pan=0.0, muffle=0.0, ticks=0, wait=True):
     import numpy as np
     import sounddevice as sd
 
@@ -530,8 +538,9 @@ def play_notes(root_hz, gain, notes, pan=0.0, muffle=0.0, ticks=0):
     audio = gain * audio / max(np.abs(audio).max(), 1e-9)
     if not supports_stereo_output():
         audio = audio.mean(axis=1)
-    sd.play(audio.astype(np.float32), SAMPLE_RATE)
-    sd.wait()
+    sd.play(audio.astype(np.float32), SAMPLE_RATE, latency="low")
+    if wait:
+        sd.wait()
 
 
 def resolve_hook_event(payload: dict) -> tuple[str | None, dict]:
@@ -572,6 +581,12 @@ def build_root_flags(args) -> list[str]:
     return []
 
 
+def play_argv(args, placement, notes):
+    pan, muffle, ticks = placement
+    return [*build_root_flags(args), f"--pan={pan:.4f}", f"--muffle={muffle:.4f}", f"--ticks={ticks}",
+            "--", *(f"{s:g},{v:g},{ms:g}" for s, v, ms in notes)]
+
+
 def spawn_detached(beep_args: list[str]) -> None:
     cmd = [sys.executable, str(pathlib.Path(__file__).resolve()), *beep_args]
     kwargs: dict = {
@@ -598,12 +613,13 @@ def run_hook(args) -> int:
         if melody:
             cwd = payload.get("cwd")
             placement = resolve_spatial(args, cwd if isinstance(cwd, str) else None)
+            notes = [parse_note(m) for m in melody]
             if args.sync:
-                play_notes(*resolve_mic(args), [parse_note(m) for m in melody], *placement)
+                play_notes(*resolve_mic(args), notes, *placement)
             else:
-                pan, muffle, ticks = placement
-                spawn_detached([*build_root_flags(args), f"--pan={pan:.4f}", f"--muffle={muffle:.4f}",
-                                f"--ticks={ticks}", "--", *melody])
+                argv = play_argv(args, placement, notes)
+                if not send_to_daemon(argv):
+                    spawn_detached(["--listen", *argv])
     except Exception as e:
         print(f"[beep] hook error: {e!r}", file=sys.stderr)
 
@@ -617,7 +633,7 @@ def main(argv=None):
     if args.hook and args.notes:
         parser.error("positional notes cannot be combined with --hook")
     if args.listen:
-        return listen()
+        return listen(args)
     if args.melody:
         if args.hook or args.notes:
             parser.error("--melody cannot be combined with --hook or positional notes")
@@ -628,7 +644,9 @@ def main(argv=None):
     if args.hook:
         return run_hook(args)
 
-    play_notes(*resolve_mic(args), args.notes, *resolve_spatial(args))
+    placement = resolve_spatial(args)
+    if not send_to_daemon(play_argv(args, placement, args.notes)):
+        play_notes(*resolve_mic(args), args.notes, *placement)
     return 0
 
 
