@@ -6,7 +6,7 @@
   ms:        time until the next note in milliseconds, 0-10000; notes ring past it
 
   --root         Hz number (523.25) or note name (C5, F#4, Bb3). Default: 440 (A4). Max 20000.
-                 Folded by octaves into 600-1200 Hz
+                 Folded by octaves into 400-800 Hz
   --auto-key     record SECONDS (default 2) of mic audio, use detected key's tonic as root
   --avoid-speech record SECONDS (default 1.5) of mic audio, use quietest region as root
   --mic          record SECONDS (default 2) of mic audio, auto-detect music vs talking
@@ -38,26 +38,25 @@ import subprocess
 import sys
 
 SAMPLE_RATE = 44100
-BELL_PARTIALS = ((1, 1.0, 0.275), (2, 0.22, 0.11), (3, 0.04, 0.04), (4, 0.15, 0.03))
+BELL_PARTIALS = ((1, 1.0, 0.275), (2, 0.22, 0.275), (3, 0.12, 0.2))
+MUD_HZ = 500.0
 TONE_LENGTH = 0.15
-BELL_ATTACK_S = 0.0035
+BELL_ATTACK_S = 0.015
+OVERTONE_RISE_S = 0.03
 BELL_RELEASE_S = 0.013
 NOTE_RING_S = 0.68
 TEMPO = 0.93
 LEAD_S = 0.001
 STEREO_SPREAD = 0.24
-STUTTER_COUNT = 1
-STUTTER_GRAIN_S = 0.035
-STUTTER_SPACING_S = 0.039
-STUTTER_LEVEL = 0.5
-STUTTER_DECAY_S = 0.008
 AMBIENT_DB = (-55.0, -25.0)
-AMBIENT_GAIN = (0.5, 1.0)
-DEFAULT_GAIN = 0.5
+AMBIENT_GAIN = (0.25, 1.0)
+DEFAULT_GAIN = 0.25
 AMBIENT_FRAME_S = 0.05
 AMBIENT_PERCENTILE = 50
+TICK_HZ = 2200.0
 TICK_VOL = 1.0
-TICK_MS = 60
+TICK_MS = 8
+LOW_CUT_HZ = 500.0
 CLICK_GAP_MS = 85
 CLICK_LEAD_MS = 60
 
@@ -65,7 +64,7 @@ DEFAULT_ROOT_HZ = 440.0
 DEFAULT_AUTO_KEY_SECONDS = 2.0
 DEFAULT_AVOID_SPEECH_SECONDS = 1.5
 DEFAULT_MIC_SECONDS = 2.0
-ROOT_BAND_HZ = 1200.0
+ROOT_BAND_HZ = 800.0
 MAX_ROOT_HZ = 20000.0
 MAX_RECORD_SECONDS = 30.0
 NOTE_LIMITS = ((-48.0, 48.0, "semitones"), (0.0, 1.0, "vol"), (0.0, 10000.0, "ms"))
@@ -94,7 +93,7 @@ ANTIGRAVITY_FAILURE_REASONS = (
 
 HOOK_MELODIES: dict[str, tuple[str, ...]] = {
     "SessionStart": ("0,0.9,72", "4,1,72", "7,1,99"),
-    "Stop": ("0,0.9,99", "-4,0.9,131"),
+    "Stop": ("0,0.9,99",),
     "StopFailure": ("0,0.9,110", "-3,0.95,110", "-6,1,185"),
     "PostToolUseFailure": ("5,0.7,90", "-1,0.7,220"),
     "PostCompact": ("0,0.9,61", "2,1,83"),
@@ -168,15 +167,25 @@ def parse_clamped_float(lo, hi, name):
     return _parse
 
 
-def apply_muffle(mono, amount, sample_rate=SAMPLE_RATE):
+def spectral_filter(mono, response, sample_rate=SAMPLE_RATE):
+    import numpy as np
+
+    freqs = np.fft.rfftfreq(len(mono), 1 / sample_rate)
+    return np.fft.irfft(np.fft.rfft(mono) * response(freqs), len(mono))
+
+
+def low_cut(mono, cutoff=LOW_CUT_HZ):
+    return spectral_filter(mono, lambda f: (f / cutoff) ** 2 / (1 + (f / cutoff) ** 2))
+
+
+def apply_muffle(mono, amount):
     import numpy as np
 
     if amount <= 0.0 or not mono.any():
         return mono
 
     cutoff = 1500.0 - 1000.0 * amount
-    freqs = np.fft.rfftfreq(len(mono), 1 / sample_rate)
-    out = np.fft.irfft(np.fft.rfft(mono) / (1 + (freqs / cutoff) ** 2), len(mono))
+    out = spectral_filter(mono, lambda f: 1 / (1 + (f / cutoff) ** 2))
     return (out * (np.abs(mono).max() / np.abs(out).max())).astype(np.float32)
 
 
@@ -208,7 +217,11 @@ def bell(freq, num_samples, partials, attack_s):
     import numpy as np
 
     t = np.arange(num_samples) / SAMPLE_RATE
-    body = sum(w * np.sin(2 * np.pi * freq * r * t) * np.exp(-t / tau) for r, w, tau in partials)
+    rise = 1 - np.exp(-t / OVERTONE_RISE_S)
+    weights = [w / (1 + (MUD_HZ / (freq * r)) ** 8) for r, w, _ in partials]
+    scale = sum(w for _, w, _ in partials) / sum(weights)
+    body = scale * sum(w * np.sin(2 * np.pi * freq * r * t) * np.exp(-t / tau) * (rise if r > 1 else 1)
+                       for (r, _, tau), w in zip(partials, weights))
     envelope = np.minimum(t / attack_s, 1)
     release = min(num_samples, int(SAMPLE_RATE * BELL_RELEASE_S))
     envelope[num_samples - release:] *= np.arange(release - 1, -1, -1) / max(release, 1)
@@ -216,7 +229,6 @@ def bell(freq, num_samples, partials, attack_s):
 
 
 def place(out, mono, onset, pan):
-    onset = max(onset, 0)
     n = min(len(mono), len(out) - onset)
     if n > 0:
         out[onset:onset + n] += pan_stereo(mono[:n], pan)
@@ -234,15 +246,9 @@ def render_phrase(root_hz, notes):
         return None
 
     out = np.zeros((starts[-1] + ring, 2))
-    grain = int(SAMPLE_RATE * STUTTER_GRAIN_S)
-    grain_window = np.exp(-np.arange(grain) / (SAMPLE_RATE * STUTTER_DECAY_S))
     for k, (semi, vol, onset) in enumerate(voiced):
         freq, pan = semitone_to_hz(root_hz, semi), STEREO_SPREAD * (-1) ** k
         place(out, vol * bell(freq, ring, partials, BELL_ATTACK_S), onset, pan)
-        if k in (0, len(voiced) - 1):
-            stutter = STUTTER_LEVEL * vol * bell(freq, grain, partials, BELL_ATTACK_S) * grain_window
-            for j in range(2, STUTTER_COUNT + 2):
-                place(out, stutter, onset - int(SAMPLE_RATE * STUTTER_SPACING_S * j), pan)
     return out
 
 
@@ -302,8 +308,8 @@ def format_key_candidates(candidates, n=3):
     return ", ".join(f"{PITCH_CLASSES[t]} {m} ({c:.2f})" for t, m, c in candidates[:n])
 
 
-def pitch_class_to_hz(pc):
-    return 440.0 * 2 ** ((pc - 9) / 12)
+def key_root_hz(pc, mode):
+    return 440.0 * 2 ** ((pc + (3 if mode == "minor" else 0) - 9) / 12)
 
 
 def best_key(buffer, sample_rate):
@@ -321,7 +327,7 @@ def detect_key(buffer, sample_rate):
     if key is None:
         return DEFAULT_ROOT_HZ, "silence"
     pc, mode, _ = key
-    return pitch_class_to_hz(pc), f"detected key={PITCH_CLASSES[pc]} {mode}"
+    return key_root_hz(pc, mode), f"detected key={PITCH_CLASSES[pc]} {mode}"
 
 
 def detect_quiet_region(buffer, sample_rate):
@@ -356,7 +362,7 @@ def classify_mic(buffer, sample_rate):
         return DEFAULT_ROOT_HZ, "silence"
     pc, mode, corr = key
     if corr >= MUSIC_CONFIDENCE_THRESHOLD:
-        return pitch_class_to_hz(pc), f"music: {PITCH_CLASSES[pc]} {mode} (key confidence {corr:.2f})"
+        return key_root_hz(pc, mode), f"music: {PITCH_CLASSES[pc]} {mode} (key confidence {corr:.2f})"
     return detect_quiet_freq(buffer, sample_rate), f"talking: no clear key (confidence {corr:.2f}), using quietest region"
 
 
@@ -528,10 +534,12 @@ def play_notes(root_hz, gain, notes, pan=0.0, muffle=0.0, ticks=0, wait=True):
     audio = render_phrase(root_hz, notes)
     if audio is None:
         return
-    audio = np.stack([apply_muffle(channel, muffle) for channel in audio.T], axis=1)
+    audio = np.stack([apply_muffle(low_cut(channel), muffle) for channel in audio.T], axis=1)
+    audio /= max(np.abs(audio).max(), 1e-9)
     if ticks:
-        pluck = TICK_VOL * bell(2 * root_hz, int(SAMPLE_RATE * TICK_MS / 1000), bell_partials(), BELL_ATTACK_S)
-        click = np.concatenate([pluck, silence(CLICK_GAP_MS)] * ticks
+        tick_s = TICK_MS / 1000
+        tick = TICK_VOL * bell(TICK_HZ, int(SAMPLE_RATE * tick_s), ((1, 1.0, tick_s / 5),), tick_s / 6)
+        click = np.concatenate([tick, silence(CLICK_GAP_MS)] * ticks
                                + [silence(CLICK_LEAD_MS)])
         audio = np.concatenate([np.column_stack((click, click)), audio])
     audio = pan_stereo(np.ones(1), pan) * math.sqrt(2) * audio

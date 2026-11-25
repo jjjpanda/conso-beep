@@ -17,7 +17,7 @@ Point the harness hooks at `python -S <path>/beep.py --hook --mic`, or clone the
 - `--hook` reads hook JSON from `stdin`, prints hook JSON to `stdout`, and sends the event's melody to a background daemon. It starts the daemon if none runs. The daemon exits after 10 idle minutes.
 - `-S` makes the hook start fast. `--sync` plays in-process instead, and needs plain `python`.
 - `--mic` matches pitch and volume to the room.
-- On Windows, the beep pans toward the source monitor. Beeps from other virtual desktops sound muffled, with one pluck per desktop away.
+- On Windows, the beep pans toward the source monitor. Beeps from other virtual desktops sound muffled, with one tick per desktop away.
 
 ## CLI
 
