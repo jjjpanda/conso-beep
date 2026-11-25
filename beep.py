@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Usage: beep.py [--root HZ|NOTE | --auto-key [SECONDS] | --avoid-speech [SECONDS] | --mic [SECONDS]] [--pan PAN] [--muffle MUFFLE] [--ticks N] [--verbose] [--sync] [--melody NAME | -- semitones,vol,ms ...]
        beep.py --ask TITLE [--detail TEXT] [--source NAME] [--ask-timeout SECONDS] [--melody NAME] [--mic [SECONDS]]
+       beep.py --alert TITLE [--detail TEXT] [--source NAME] [--melody NAME] [--mic [SECONDS]]
        beep.py --listen
   semitones: signed offset from root (0 = root note), -48 to 48
   vol:       0.0-1.0; 0 is a rest
@@ -20,8 +21,9 @@
   --sync         play audio synchronously in-process (with stderr logs) instead of via daemon
   --melody       play a named melody from MELODIES (done, fail, tool-fail, permission, question, idle, auth, alert)
   --ask          send a permission prompt to http://127.0.0.1:47392 and print the JSON decision
-  --detail       optional detail text shown with --ask in the dashboard
-  --source       optional source label shown with --ask in the dashboard
+  --alert        show a dismiss-only alert (default melody: alert) in the dashboard; does not wait
+  --detail       optional detail text shown with --ask or --alert in the dashboard
+  --source       optional source label shown with --ask or --alert in the dashboard
   --ask-timeout  seconds to wait for a dashboard decision (default 120, max 600)
   --listen       run the HTTP dashboard & rolling-buffer mic daemon on http://127.0.0.1:47392
 
@@ -165,10 +167,12 @@ def build_arg_parser():
                         help="play a named melody instead of positional notes")
     parser.add_argument("--ask", default=None, metavar="TITLE",
                         help="send a permission request to the daemon dashboard and print JSON decision")
+    parser.add_argument("--alert", default=None, metavar="TITLE",
+                        help="show a dismiss-only alert in the daemon dashboard and return at once")
     parser.add_argument("--detail", default="",
-                        help="optional detail text shown with --ask")
+                        help="optional detail text shown with --ask or --alert")
     parser.add_argument("--source", default="",
-                        help="optional source label shown with --ask")
+                        help="optional source label shown with --ask or --alert")
     parser.add_argument("--ask-timeout", type=parse_positive_float(MAX_ASK_TIMEOUT_SECONDS, "--ask-timeout"),
                         default=DEFAULT_ASK_TIMEOUT_SECONDS, metavar="SECONDS",
                         help=f"seconds to wait for dashboard decision (default {DEFAULT_ASK_TIMEOUT_SECONDS:g})")
@@ -288,7 +292,7 @@ def dispatch_play(args, placement, notes, port=DAEMON_PORT):
         spawn_detached(["--listen", *argv])
 
 
-def run_ask(args, port=DAEMON_PORT):
+def inbox_payload(args, title, default_melody, port):
     placement = resolve_spatial(args)
     if not daemon_reachable(port=port):
         spawn_detached(["--listen"])
@@ -297,19 +301,27 @@ def run_ask(args, port=DAEMON_PORT):
             if daemon_reachable(port=port):
                 break
             time.sleep(0.05)
-
-    payload = {
-        "title": args.ask,
+    return {
+        "title": title,
         "detail": args.detail,
         "cwd": str(pathlib.Path.cwd()),
         "source": args.source,
-        "timeout": args.ask_timeout,
-        "melody": args.melody or "permission",
+        "melody": args.melody or default_melody,
         "root_flags": build_root_flags(args),
         "pan": placement[0],
         "muffle": placement[1],
         "ticks": placement[2],
     }
+
+
+def run_alert(args, port=DAEMON_PORT):
+    payload = inbox_payload(args, args.alert, "alert", port)
+    status, _ = http_post_json("/api/alerts", payload, port=port, timeout=2.0)
+    return 0 if status == 200 else 1
+
+
+def run_ask(args, port=DAEMON_PORT):
+    payload = {**inbox_payload(args, args.ask, "permission", port), "timeout": args.ask_timeout}
     status, body = http_post_json("/api/permissions", payload, port=port, timeout=args.ask_timeout + 5.0)
     if status == 200 and isinstance(body, dict):
         print(json.dumps(body))
@@ -323,12 +335,15 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.listen and args.sync:
         parser.error("--listen cannot be combined with --sync")
-    if args.ask is not None:
-        if args.listen or args.sync or args.notes:
-            parser.error("--ask cannot be combined with --listen, --sync, or positional notes")
-        if not args.ask.strip():
-            parser.error("--ask TITLE must not be empty")
-        return run_ask(args)
+    if args.ask is not None and args.alert is not None:
+        parser.error("--ask cannot be combined with --alert")
+    for flag, title, run in (("--ask", args.ask, run_ask), ("--alert", args.alert, run_alert)):
+        if title is not None:
+            if args.listen or args.sync or args.notes:
+                parser.error(f"{flag} cannot be combined with --listen, --sync, or positional notes")
+            if not title.strip():
+                parser.error(f"{flag} TITLE must not be empty")
+            return run(args)
     if args.melody:
         if args.notes:
             parser.error("--melody cannot be combined with positional notes")

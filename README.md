@@ -24,6 +24,7 @@ pip install sounddevice numpy
 - Requests send their melody to the background HTTP daemon on `http://127.0.0.1:47392`, starting it on demand (`--listen`). The daemon exits after 10 idle minutes unless `Keep Alive` is toggled in the dashboard. Pass `--sync` to play in-process with stderr logs.
 - `--melody NAME` plays a built-in tone (`done`, `fail`, `tool-fail`, `permission`, `question`, `idle`, `auth`, `alert`).
 - `--ask TITLE` posts a permission request to the dashboard inbox, plays the `permission` melody (or the `--melody` choice), and prints `{"decision": "allow"|"deny"|"timeout", "reason": "..."}` once resolved.
+- `--alert TITLE` shows a dismiss-only alert in the dashboard (for questions or notices), plays the `alert` melody (or the `--melody` choice), and returns at once.
 - `--mic` matches pitch (or avoids speech in `450-900 Hz`) and scales volume to room loudness. After the first mic-mode request, the daemon keeps the microphone open until it exits (indefinitely with `Keep Alive` on).
 - On Windows, the beep pans toward the active window's monitor. Beeps from other virtual desktops sound muffled, with one tick per desktop away.
 

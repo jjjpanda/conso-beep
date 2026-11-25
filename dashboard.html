@@ -153,6 +153,17 @@
       <div id="permList" class="perm-list"></div>
     </section>
 
+    <section id="alertCard" class="card" style="display:none;">
+      <div class="inbox-head">
+        <div class="row">
+          <h2 style="margin:0;">Alerts</h2>
+          <span id="alertCount" class="badge warn">0</span>
+        </div>
+        <button id="dismissAllBtn" type="button">Dismiss All</button>
+      </div>
+      <div id="alertList" class="perm-list"></div>
+    </section>
+
     <div class="top-grid">
       <section class="card">
         <h2>Live Room Status</h2>
@@ -234,6 +245,7 @@
   <script>
     const TOKEN = "{{TOKEN}}";
     let currentIds = [];
+    let currentAlertIds = [];
     let currentControls = { muted: false, keep_alive: false, gain_override: null };
     let renderedMelodies = "";
     let melodyNotes = {};
@@ -358,61 +370,67 @@
         return;
       }
 
-      const now = Date.now() / 1000;
       for (const p of perms) {
-        const item = document.createElement("div");
-        item.className = "perm-item";
+        list.appendChild(inboxItem(p, [
+          ["Allow", "primary", () => postJson("/api/permissions/decide", { ids: [p.id], decision: "allow" })],
+          ["Deny", "danger", () => postJson("/api/permissions/decide", { ids: [p.id], decision: "deny" })]
+        ]));
+      }
+    }
 
-        const top = document.createElement("div");
-        top.className = "perm-top";
+    function inboxItem(p, buttons) {
+      const item = document.createElement("div");
+      item.className = "perm-item";
 
-        const title = document.createElement("div");
-        title.className = "perm-title";
-        title.textContent = p.title;
-        top.appendChild(title);
+      const top = document.createElement("div");
+      top.className = "perm-top";
 
-        const actions = document.createElement("div");
-        actions.className = "row";
+      const title = document.createElement("div");
+      title.className = "perm-title";
+      title.textContent = p.title;
+      top.appendChild(title);
 
-        const allowBtn = document.createElement("button");
-        allowBtn.type = "button";
-        allowBtn.className = "primary";
-        allowBtn.textContent = "Allow";
-        allowBtn.onclick = async () => {
-          await postJson("/api/permissions/decide", { ids: [p.id], decision: "allow" });
+      const actions = document.createElement("div");
+      actions.className = "row";
+      for (const [label, cls, action] of buttons) {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = cls;
+        btn.textContent = label;
+        btn.onclick = async () => {
+          await action();
           refresh();
         };
+        actions.appendChild(btn);
+      }
+      top.appendChild(actions);
+      item.appendChild(top);
 
-        const denyBtn = document.createElement("button");
-        denyBtn.type = "button";
-        denyBtn.className = "danger";
-        denyBtn.textContent = "Deny";
-        denyBtn.onclick = async () => {
-          await postJson("/api/permissions/decide", { ids: [p.id], decision: "deny" });
-          refresh();
-        };
+      const age = Math.max(0, Math.round(Date.now() / 1000 - p.created_at));
+      const metaParts = [p.source || "cli", age + "s ago"];
+      if (p.cwd) metaParts.push(p.cwd);
+      const meta = document.createElement("div");
+      meta.className = "perm-meta";
+      meta.textContent = metaParts.join(" · ");
+      item.appendChild(meta);
 
-        actions.appendChild(allowBtn);
-        actions.appendChild(denyBtn);
-        top.appendChild(actions);
-        item.appendChild(top);
+      if (p.detail) {
+        const pre = document.createElement("pre");
+        pre.className = "perm-detail";
+        pre.textContent = p.detail;
+        item.appendChild(pre);
+      }
+      return item;
+    }
 
-        const age = Math.max(0, Math.round(now - p.created_at));
-        const metaParts = [p.source || "cli", age + "s ago"];
-        if (p.cwd) metaParts.push(p.cwd);
-        const meta = document.createElement("div");
-        meta.className = "perm-meta";
-        meta.textContent = metaParts.join(" · ");
-        item.appendChild(meta);
-
-        if (p.detail) {
-          const pre = document.createElement("pre");
-          pre.className = "perm-detail";
-          pre.textContent = p.detail;
-          item.appendChild(pre);
-        }
-
-        list.appendChild(item);
+    function renderAlerts(alerts) {
+      currentAlertIds = alerts.map((a) => a.id);
+      document.getElementById("alertCard").style.display = alerts.length ? "" : "none";
+      document.getElementById("alertCount").textContent = String(alerts.length);
+      const list = document.getElementById("alertList");
+      list.textContent = "";
+      for (const a of alerts) {
+        list.appendChild(inboxItem(a, [["Dismiss", "", () => postJson("/api/alerts/dismiss", { ids: [a.id] })]]));
       }
     }
 
@@ -430,6 +448,7 @@
         renderMic(data.mic);
         renderControls(data.controls);
         renderPermissions(data.permissions);
+        renderAlerts(data.alerts || []);
       } catch (_err) {
         conn.textContent = "Disconnected";
         conn.className = "badge bad";
@@ -475,6 +494,13 @@
     document.getElementById("denyAllBtn").onclick = async () => {
       if (currentIds.length) {
         await postJson("/api/permissions/decide", { ids: currentIds, decision: "deny" });
+        refresh();
+      }
+    };
+
+    document.getElementById("dismissAllBtn").onclick = async () => {
+      if (currentAlertIds.length) {
+        await postJson("/api/alerts/dismiss", { ids: currentAlertIds });
         refresh();
       }
     };

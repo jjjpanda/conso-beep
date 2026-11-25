@@ -484,6 +484,30 @@ class DaemonHttpTest(unittest.TestCase):
             self.assertEqual(len(played), 1)
             self.assertEqual(self.spatial_calls[-1], ((0.4, 0.2, 1), expected))
 
+    def test_alert_shows_plays_and_dismisses(self):
+        expected = [beep.parse_note(m) for m in beep.MELODIES["alert"]]
+        with self.running_daemon() as (port, token, _played, played_event):
+            alert_args = beep.build_arg_parser().parse_args(
+                ["--alert", "Which DB?", "--detail", "postgres or sqlite", "--pan", "0", "--muffle", "0", "--ticks", "0"]
+            )
+            self.assertEqual(beep.run_alert(alert_args, port=port), 0)
+            self.assertTrue(played_event.wait(timeout=2.0))
+            self.assertEqual(self.spatial_calls[-1][1], expected)
+
+            _, raw = self._http("GET", port, "/api/status")
+            data = json.loads(raw)
+            self.assertEqual(data["permissions"], [])
+            self.assertEqual([(a["title"], a["detail"]) for a in data["alerts"]], [("Which DB?", "postgres or sqlite")])
+            alert_id = data["alerts"][0]["id"]
+
+            st, _ = self._http("POST", port, "/api/alerts/dismiss", {"ids": [alert_id]})
+            self.assertEqual(st, 403)
+            st, raw = self._http("POST", port, "/api/alerts/dismiss", {"ids": [alert_id]}, {"X-Conso-Token": token})
+            self.assertEqual(st, 200)
+            self.assertEqual(json.loads(raw)["dismissed"], [alert_id])
+            _, raw = self._http("GET", port, "/api/status")
+            self.assertEqual(json.loads(raw)["alerts"], [])
+
     def test_port_audio_error_reinitializes_and_retries(self):
         with mock.patch.object(daemon.sd, "_terminate") as term, mock.patch.object(daemon.sd, "_initialize") as init, \
                 self.running_daemon(play_errors=[daemon.sd.PortAudioError("device lost")]) as (port, _token, played, played_event):

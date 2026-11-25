@@ -37,6 +37,7 @@ def serve(args, parse_request, resolve_spatial_fn, melodies, port=DAEMON_PORT, r
     token = secrets.token_hex(16)
     controls = {"muted": False, "gain_override": None, "keep_alive": False}
     permissions: dict[str, dict] = {}
+    alerts: dict[str, dict] = {}
     state_lock = threading.Lock()
     activity = {"ts": time.monotonic()}
     stop_event = threading.Event()
@@ -50,6 +51,26 @@ def serve(args, parse_request, resolve_spatial_fn, melodies, port=DAEMON_PORT, r
                     entry["decision"] = "timeout"
                     entry["reason"] = "daemon stopped"
                 entry["event"].set()
+
+    def public_fields(entry):
+        return {k: entry[k] for k in ("id", "title", "detail", "cwd", "source", "created_at")}
+
+    def queue_melody(body, default):
+        melody_name = body.get("melody", default)
+        if not isinstance(melody_name, str) or melody_name not in melodies:
+            return
+        try:
+            root_flags = body.get("root_flags") or []
+            if isinstance(root_flags, list) and all(isinstance(x, str) for x in root_flags):
+                pan = float(body.get("pan", 0.0))
+                muffle = float(body.get("muffle", 0.0))
+                ticks = int(body.get("ticks", 0))
+                argv = [*root_flags, f"--pan={pan:.4f}", f"--muffle={muffle:.4f}", f"--ticks={ticks}", "--", *melodies[melody_name]]
+                req = parse_request(argv)
+                if req.notes:
+                    play_queue.put(req)
+        except (Exception, SystemExit):
+            pass
 
     def worker_loop():
         while True:
@@ -155,23 +176,15 @@ def serve(args, parse_request, resolve_spatial_fn, melodies, port=DAEMON_PORT, r
                     else:
                         idle_remaining = max(0, round(DAEMON_IDLE_S - (time.monotonic() - activity["ts"])))
                     ctrl["idle_remaining_s"] = idle_remaining
-                    perms = [
-                        {
-                            "id": e["id"],
-                            "title": e["title"],
-                            "detail": e["detail"],
-                            "cwd": e["cwd"],
-                            "source": e["source"],
-                            "created_at": e["created_at"],
-                        }
-                        for e in permissions.values()
-                    ]
+                    perms = [public_fields(e) for e in permissions.values()]
+                    alert_list = [public_fields(e) for e in alerts.values()]
                 self._send_json(
                     200,
                     {
                         "mic": mic_status,
                         "controls": ctrl,
                         "permissions": perms,
+                        "alerts": alert_list,
                         "melodies": list(melodies.keys()),
                         "melody_notes": {k: " ".join(v) for k, v in melodies.items()},
                     },
@@ -185,7 +198,7 @@ def serve(args, parse_request, resolve_spatial_fn, melodies, port=DAEMON_PORT, r
                 return
             path = self.path.split("?", 1)[0]
 
-            if path in ("/api/permissions/decide", "/api/controls", "/api/stop") and not self._valid_token():
+            if path in ("/api/permissions/decide", "/api/alerts/dismiss", "/api/controls", "/api/stop") and not self._valid_token():
                 self._send_json(403, {"error": "invalid token"})
                 return
 
@@ -251,7 +264,7 @@ def serve(args, parse_request, resolve_spatial_fn, melodies, port=DAEMON_PORT, r
                 self._send_json(200, {"ok": True, "muted": muted})
                 return
 
-            if path == "/api/permissions":
+            if path in ("/api/permissions", "/api/alerts"):
                 if not isinstance(body, dict):
                     self._send_json(400, {"error": "expected JSON object"})
                     return
@@ -265,11 +278,6 @@ def serve(args, parse_request, resolve_spatial_fn, melodies, port=DAEMON_PORT, r
                 if not all(isinstance(v, str) for v in (detail, cwd, source)):
                     self._send_json(400, {"error": "detail, cwd, and source must be strings"})
                     return
-                timeout = body.get("timeout", DEFAULT_ASK_TIMEOUT_S)
-                if not isinstance(timeout, (int, float)) or isinstance(timeout, bool) or not math.isfinite(timeout) or timeout <= 0 or timeout > MAX_ASK_TIMEOUT_S:
-                    self._send_json(400, {"error": "invalid timeout"})
-                    return
-
                 entry = {
                     "id": secrets.token_hex(8),
                     "title": title.strip(),
@@ -277,29 +285,29 @@ def serve(args, parse_request, resolve_spatial_fn, melodies, port=DAEMON_PORT, r
                     "cwd": cwd,
                     "source": source,
                     "created_at": time.time(),
-                    "event": threading.Event(),
-                    "decision": None,
-                    "reason": "",
                 }
+
+                if path == "/api/alerts":
+                    with state_lock:
+                        alerts[entry["id"]] = entry
+                        activity["ts"] = time.monotonic()
+                        muted = controls["muted"]
+                    if not muted:
+                        queue_melody(body, "alert")
+                    self._send_json(200, {"ok": True, "id": entry["id"]})
+                    return
+
+                timeout = body.get("timeout", DEFAULT_ASK_TIMEOUT_S)
+                if not isinstance(timeout, (int, float)) or isinstance(timeout, bool) or not math.isfinite(timeout) or timeout <= 0 or timeout > MAX_ASK_TIMEOUT_S:
+                    self._send_json(400, {"error": "invalid timeout"})
+                    return
+                entry.update(event=threading.Event(), decision=None, reason="")
                 with state_lock:
                     permissions[entry["id"]] = entry
                     activity["ts"] = time.monotonic()
                     muted = controls["muted"]
-
-                melody_name = body.get("melody", "permission")
-                if isinstance(melody_name, str) and melody_name in melodies and not muted:
-                    try:
-                        root_flags = body.get("root_flags") or []
-                        if isinstance(root_flags, list) and all(isinstance(x, str) for x in root_flags):
-                            pan = float(body.get("pan", 0.0))
-                            muffle = float(body.get("muffle", 0.0))
-                            ticks = int(body.get("ticks", 0))
-                            argv = [*root_flags, f"--pan={pan:.4f}", f"--muffle={muffle:.4f}", f"--ticks={ticks}", "--", *melodies[melody_name]]
-                            req = parse_request(argv)
-                            if req.notes:
-                                play_queue.put(req)
-                    except (Exception, SystemExit):
-                        pass
+                if not muted:
+                    queue_melody(body, "permission")
 
                 try:
                     entry["event"].wait(timeout=float(timeout))
@@ -335,6 +343,17 @@ def serve(args, parse_request, resolve_spatial_fn, melodies, port=DAEMON_PORT, r
                             entry["event"].set()
                             decided.append(pid)
                 self._send_json(200, {"decided": decided})
+                return
+
+            if path == "/api/alerts/dismiss":
+                ids = body.get("ids") if isinstance(body, dict) else None
+                if not isinstance(ids, list) or not all(isinstance(x, str) for x in ids):
+                    self._send_json(400, {"error": "ids must be a list of strings"})
+                    return
+                with state_lock:
+                    activity["ts"] = time.monotonic()
+                    dismissed = [aid for aid in ids if alerts.pop(aid, None) is not None]
+                self._send_json(200, {"dismissed": dismissed})
                 return
 
             if path == "/api/controls":
