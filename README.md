@@ -1,6 +1,6 @@
 # conso-beep
 
-Ambient-aware beeps for LLM agent harness hooks. Flags are in the `beep.py` docstring.
+Ambient-aware audio tones for CLI and background notifications. Flags are in the `beep.py` docstring.
 
 ## Install
 
@@ -10,17 +10,22 @@ Python 3.10+.
 pip install sounddevice numpy
 ```
 
-Point the harness hooks at `python -S <path>/beep.py --hook --mic`, or clone the repo into the harness plugin folder (`plugin.json` and `hooks.json` are the manifest).
+## Layout
+
+- `beep.py` — stdlib-only CLI and daemon client (`python -S` fast path).
+- `audio.py` — DSP bell synthesis, mic analysis, and rolling-buffer daemon (`--listen`).
+- `spatial.py` — Windows monitor panning and virtual-desktop muffling/ticks.
 
 ## How it works
 
-- `--hook` reads hook JSON from `stdin`, prints hook JSON to `stdout`, and sends the event's melody to a background daemon. It starts the daemon if none runs. The daemon exits after 10 idle minutes.
-- `-S` makes the hook start fast. `--sync` plays in-process instead, and needs plain `python`.
-- `--mic` matches pitch and volume to the room.
-- On Windows, the beep pans toward the source monitor. Beeps from other virtual desktops sound muffled, with one tick per desktop away.
+- Requests send their melody to the background daemon on `127.0.0.1:47392`, starting it on demand (`--listen`). The daemon exits after 10 idle minutes. Pass `--sync` to play in-process with stderr logs.
+- `--melody NAME` plays a built-in tone (`done`, `fail`, `tool-fail`, `permission`, `question`, `idle`, `auth`, `alert`).
+- `--mic` matches pitch (or avoids speech in `400-800 Hz`) and scales volume to room loudness.
+- On Windows, the beep pans toward the active window's monitor. Beeps from other virtual desktops sound muffled, with one tick per desktop away.
 
 ## CLI
 
 ```bash
 python beep.py --root C5 -- 0,0.4,55 4,0.5,55 7,0.55,80
+python -S beep.py --mic --melody done
 ```

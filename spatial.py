@@ -18,17 +18,21 @@ def compute_monitor_pan(
 
     ordered = sorted(
         monitors,
-        key=lambda m: ((m[1] + m[3]) / 2.0, m[2]),
+        key=lambda m: (m[1], m[2]),
     )
     col_map: dict[int, int] = {}
     col_idx = 0
-    current_col_x = (ordered[0][1] + ordered[0][3]) / 2.0
+    col_left, col_right = ordered[0][1], ordered[0][3]
 
     for hmon, left, _top, right, _bottom in ordered:
-        center_x = (left + right) / 2.0
-        if center_x - current_col_x >= 200.0:
+        overlap = min(right, col_right) - max(left, col_left)
+        min_width = min(max(1, right - left), max(1, col_right - col_left))
+        if overlap < 0.5 * min_width:
             col_idx += 1
-            current_col_x = center_x
+            col_left, col_right = left, right
+        else:
+            col_left = min(col_left, left)
+            col_right = max(col_right, right)
         col_map[hmon] = col_idx
 
     num_cols = col_idx + 1
@@ -119,7 +123,13 @@ if sys.platform == "win32":
         "system",
         "idle",
     })
-    _VSCODE_EXES = frozenset({"code.exe", "code - insiders.exe"})
+    _VSCODE_EXES = frozenset({
+        "code.exe",
+        "code - insiders.exe",
+        "cursor.exe",
+        "windsurf.exe",
+        "codium.exe",
+    })
     _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
     _GW_OWNER = 4
     _GWL_EXSTYLE = -20
@@ -131,6 +141,7 @@ if sys.platform == "win32":
     _CLSID_VDA = "{AA509086-5CA9-4C25-8F95-589D3C07B48A}"
     _IID_VDA = "{A5CD92FF-29BE-454C-8D04-D82879FB3F1B}"
     _VD_REG_PATH = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\VirtualDesktops"
+    _SESSION_INFO_PATH = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\SessionInfo"
 
     class _PROCESSENTRY32W(ctypes.Structure):
         _fields_ = [
@@ -297,7 +308,9 @@ if sys.platform == "win32":
 
         for pid, _exe in _ancestor_chain(os.getpid(), procs):
             if pid in by_pid:
-                return pick_best_window(by_pid[pid], cwd)
+                hwnd = pick_best_window(by_pid[pid], cwd)
+                if hwnd is not None:
+                    return hwnd
 
         con_hwnd = _kernel32.GetConsoleWindow()
         if con_hwnd:
@@ -307,7 +320,9 @@ if sys.platform == "win32":
             _user32.GetWindowThreadProcessId(con_hwnd, ctypes.byref(con_pid))
             for pid, _exe in _ancestor_chain(con_pid.value, procs):
                 if pid in by_pid:
-                    return pick_best_window(by_pid[pid], cwd)
+                    hwnd = pick_best_window(by_pid[pid], cwd)
+                    if hwnd is not None:
+                        return hwnd
 
         if os.environ.get("TERM_PROGRAM") == "vscode" or any(k.startswith("VSCODE_") for k in os.environ):
             vsc_windows = [
@@ -320,7 +335,7 @@ if sys.platform == "win32":
             if wt_windows:
                 return pick_best_window(wt_windows, cwd)
 
-        return None
+        return pick_best_window([(h, t) for h, _p, _c, t in windows], cwd)
 
     def _get_monitor_pan(hwnd: int) -> tuple[float, int, int]:
         monitors: list[tuple[int, int, int, int, int]] = []
@@ -338,14 +353,45 @@ if sys.platform == "win32":
         return compute_monitor_pan(monitors, target_hmon)
 
     def _read_registry_desktops() -> tuple[list[uuid.UUID], uuid.UUID | None]:
+        ids: list[uuid.UUID] = []
+        cur: uuid.UUID | None = None
         try:
             with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _VD_REG_PATH) as key:
-                ids_raw, _ = winreg.QueryValueEx(key, "VirtualDesktopIDs")
-                cur_raw, _ = winreg.QueryValueEx(key, "CurrentVirtualDesktop")
+                try:
+                    ids_raw, _ = winreg.QueryValueEx(key, "VirtualDesktopIDs")
+                    ids = [uuid.UUID(bytes_le=ids_raw[i : i + 16]) for i in range(0, len(ids_raw) - 15, 16)]
+                except OSError:
+                    pass
+                try:
+                    cur_raw, _ = winreg.QueryValueEx(key, "CurrentVirtualDesktop")
+                    if len(cur_raw) == 16:
+                        cur = uuid.UUID(bytes_le=cur_raw)
+                except OSError:
+                    pass
         except OSError:
             return ([], None)
-        ids = [uuid.UUID(bytes_le=ids_raw[i : i + 16]) for i in range(0, len(ids_raw) - 15, 16)]
-        cur = uuid.UUID(bytes_le=cur_raw) if len(cur_raw) == 16 else None
+
+        if cur is None:
+            try:
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _SESSION_INFO_PATH) as si_key:
+                    idx = 0
+                    while True:
+                        try:
+                            sub = winreg.EnumKey(si_key, idx)
+                            idx += 1
+                        except OSError:
+                            break
+                        try:
+                            with winreg.OpenKey(si_key, f"{sub}\\VirtualDesktops") as vd_key:
+                                cur_raw, _ = winreg.QueryValueEx(vd_key, "CurrentVirtualDesktop")
+                                if len(cur_raw) == 16:
+                                    cur = uuid.UUID(bytes_le=cur_raw)
+                                    break
+                        except OSError:
+                            continue
+            except OSError:
+                pass
+
         return (ids, cur)
 
     def _get_desktop_info(hwnd: int) -> tuple[int | None, bool | None]:
@@ -360,10 +406,7 @@ if sys.platform == "win32":
             if hr < 0 or not ptr.value:
                 return (None, None)
 
-            vtable = ctypes.cast(
-                ctypes.cast(ptr, ctypes.POINTER(ctypes.c_void_p)).contents,
-                ctypes.POINTER(ctypes.c_void_p),
-            )
+            vtable = ctypes.cast(ptr, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
             is_cur_fn = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, wt.HWND, ctypes.POINTER(wt.BOOL))(vtable[3])
             get_id_fn = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, wt.HWND, ctypes.POINTER(_GUID))(vtable[4])
 
