@@ -62,8 +62,10 @@ class BeepCliTest(unittest.TestCase):
 
 class AudioDspTest(unittest.TestCase):
     def test_fold_root(self):
-        self.assertAlmostEqual(audio.fold_root(110.0), 440.0)
-        self.assertAlmostEqual(audio.fold_root(1600.0), 800.0)
+        self.assertAlmostEqual(audio.fold_root(110.0), 880.0)
+        self.assertAlmostEqual(audio.fold_root(900.0), 900.0)
+        self.assertAlmostEqual(audio.fold_root(1800.0), 900.0)
+        self.assertAlmostEqual(audio.fold_root(450.0), 900.0)
         self.assertAlmostEqual(audio.fold_root(400.0), 800.0)
 
     def test_compute_chroma_unbiased_and_sine(self):

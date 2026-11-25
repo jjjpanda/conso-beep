@@ -31,6 +31,7 @@ CLICK_LEAD_MS = 60
 
 DEFAULT_ROOT_HZ = 440.0
 ROOT_BAND_HZ = 800.0
+MAX_ROOT_HZ = 900.0
 MAX_RECORD_SECONDS = 30.0
 MUSIC_CONFIDENCE_THRESHOLD = 0.35
 CHROMA_FMIN, CHROMA_FMAX = 130.0, 2100.0
@@ -69,10 +70,10 @@ def semitone_to_hz(root_hz, semitones):
     return root_hz * 2 ** (semitones / 12)
 
 
-def fold_root(freq, band_hz=ROOT_BAND_HZ):
-    while freq > band_hz:
+def fold_root(freq, max_hz=MAX_ROOT_HZ):
+    while freq > max_hz:
         freq /= 2
-    while freq <= band_hz / 2:
+    while freq <= max_hz / 2:
         freq *= 2
     return freq
 

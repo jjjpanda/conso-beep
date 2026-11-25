@@ -7,7 +7,7 @@
   ms:        time until the next note in milliseconds, 0-10000; notes ring past it
 
   --root         Hz number (523.25) or note name (C5, F#4, Bb3). Default: 440 (A4). Max 20000.
-                 Folded by octaves into 400-800 Hz
+                 Folded by octaves into 450-900 Hz
   --auto-key     record SECONDS (default 2) of mic audio, use detected key signature's root
   --avoid-speech record SECONDS (default 1.5) of mic audio, use quietest region in 400-800 Hz as root
   --mic          record SECONDS (default 2) of mic audio, auto-detect music vs talking
