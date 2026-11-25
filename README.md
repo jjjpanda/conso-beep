@@ -15,7 +15,7 @@ pip install sounddevice numpy
 - `beep.py` — stdlib-only CLI, `--ask` client, and daemon dispatcher (`python -S` fast path).
 - `audio.py` — DSP bell synthesis, mic analysis, and rolling `MicRing` telemetry.
 - `daemon.py` — localhost HTTP server (`http://127.0.0.1:47392`), playback worker, and permission inbox.
-- `dashboard.html` — live room status, quick controls, and multi-permission queue UI.
+- `dashboard.html` — permission inbox (top), live room status, quick controls, and a play panel with tone, pan, muffle, and ticks.
 - `spatial.py` — Windows monitor panning and virtual-desktop muffling/ticks.
 - `tests/` — `unittest` suite (`python -m unittest discover -s tests -v`).
 

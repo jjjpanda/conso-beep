@@ -139,6 +139,20 @@
 
     <div id="offlineBanner" class="banner">Daemon disconnected.</div>
 
+    <section class="card">
+      <div class="inbox-head">
+        <div class="row">
+          <h2 style="margin:0;">Pending Permissions</h2>
+          <span id="permCount" class="badge">0</span>
+        </div>
+        <div class="row">
+          <button id="allowAllBtn" class="primary" type="button" disabled>Allow All</button>
+          <button id="denyAllBtn" class="danger" type="button" disabled>Deny All</button>
+        </div>
+      </div>
+      <div id="permList" class="perm-list"></div>
+    </section>
+
     <div class="top-grid">
       <section class="card">
         <h2>Live Room Status</h2>
@@ -196,6 +210,17 @@
         </div>
       </div>
       <div class="controls-stack">
+        <div class="row">
+          <span class="k">Pan</span>
+          <input id="panSlider" type="range" min="-1" max="1" step="0.1" value="0">
+          <span id="panVal" class="v">0.0</span>
+          <span class="k">Muffle</span>
+          <input id="muffleSlider" type="range" min="0" max="1" step="0.1" value="0">
+          <span id="muffleVal" class="v">0.0</span>
+          <span class="k">Ticks</span>
+          <input id="ticksSlider" type="range" min="0" max="3" step="1" value="0">
+          <span id="ticksVal" class="v">0</span>
+        </div>
         <div id="melodyBtns" class="row"></div>
         <form id="customPlayForm" class="row">
           <input id="notesInput" type="text" placeholder="0,0.9,72 4,1,72 7,1,99" value="0,0.9,72 4,1,72 7,1,99">
@@ -203,20 +228,6 @@
         </form>
         <div id="playStatus" class="play-status"></div>
       </div>
-    </section>
-
-    <section class="card">
-      <div class="inbox-head">
-        <div class="row">
-          <h2 style="margin:0;">Pending Permissions</h2>
-          <span id="permCount" class="badge">0</span>
-        </div>
-        <div class="row">
-          <button id="allowAllBtn" class="primary" type="button" disabled>Allow All</button>
-          <button id="denyAllBtn" class="danger" type="button" disabled>Deny All</button>
-        </div>
-      </div>
-      <div id="permList" class="perm-list"></div>
     </section>
   </div>
 
@@ -248,7 +259,10 @@
         const res = await postJson("/api/play", {
           ...payload,
           use_mic: document.getElementById("useMicCheck").checked,
-          timbre: document.getElementById("timbreSelect").value
+          timbre: document.getElementById("timbreSelect").value,
+          pan: Number(document.getElementById("panSlider").value),
+          muffle: Number(document.getElementById("muffleSlider").value),
+          ticks: Number(document.getElementById("ticksSlider").value)
         });
         status.textContent = res.muted ? "Muted (unmute to hear audio)." : "Played " + label + ".";
       } catch (err) {
@@ -423,6 +437,11 @@
       }
     }
 
+    for (const [id, digits] of [["pan", 1], ["muffle", 1], ["ticks", 0]]) {
+      document.getElementById(id + "Slider").oninput = (e) => {
+        document.getElementById(id + "Val").textContent = Number(e.target.value).toFixed(digits);
+      };
+    }
     document.getElementById("customPlayForm").onsubmit = (e) => {
       e.preventDefault();
       triggerPlay({ notes: document.getElementById("notesInput").value }, "custom notes");
