@@ -146,6 +146,39 @@ class AudioDspTest(unittest.TestCase):
         self.assertAlmostEqual(float(np.max(np.abs(played[1][:tick_n]))), 0.5 * audio.TICK_VOL, places=4)
         self.assertEqual(float(np.max(np.abs(played[1][tick_n:tick_n + gap_n]))), 0.0)
 
+    def test_play_notes_waits_before_output_and_honors_cancellation(self):
+        for allowed in (False, True):
+            order = []
+            def gate():
+                order.append("gate")
+                return allowed
+
+            with mock.patch.object(audio, "supports_stereo_output", return_value=True), \
+                    mock.patch.object(audio.sd, "play", side_effect=lambda *a, **kw: order.append("play")), \
+                    mock.patch.object(audio.sd, "wait") as wait:
+                audio.play_notes(440, 0.25, [(0, 1, 50)], before_play=gate)
+            self.assertEqual(order, ["gate", "play"] if allowed else ["gate"])
+            self.assertEqual(wait.call_count, int(allowed))
+
+    def test_gain_is_resolved_after_typing_gate(self):
+        volume = [0.75]
+        def gate():
+            volume[0] = 0.0
+            return True
+
+        with mock.patch.object(audio, "supports_stereo_output", return_value=True), \
+                mock.patch.object(audio.sd, "play") as play, mock.patch.object(audio.sd, "wait"):
+            audio.play_notes(440, volume[0], [(0, 1, 50)], before_play=gate, get_gain=lambda: volume[0])
+        self.assertEqual(float(np.max(np.abs(play.call_args.args[0]))), 0.0)
+
+    def test_recent_gain_uses_latest_samples(self):
+        ring = audio.MicRing()
+        self.assertEqual(ring.recent_gain(1.0), audio.DEFAULT_GAIN)
+        for level in (0.001, 0.1):
+            samples = np.full((audio.SAMPLE_RATE, 1), level, dtype=np.float32)
+            ring._on_audio(samples, len(samples), None, None)
+            self.assertAlmostEqual(ring.recent_gain(1.0), audio.ambient_level(samples[:, 0])[1])
+
     def test_mic_ring_resolve_for_args_modes(self):
         parser = beep.build_arg_parser()
         sr = audio.SAMPLE_RATE
@@ -236,7 +269,7 @@ class AudioDspTest(unittest.TestCase):
 
 class DaemonHttpTest(unittest.TestCase):
     @contextlib.contextmanager
-    def running_daemon(self, play_errors=()):
+    def running_daemon(self, play_errors=(), typing_wait=None):
         played = []
         play_errors = list(play_errors)
         self.spatial_calls = []
@@ -270,6 +303,7 @@ class DaemonHttpTest(unittest.TestCase):
                 mock.patch.object(audio.sd, "InputStream", return_value=FakeStream()), \
                 mock.patch.object(audio.sd, "play", side_effect=fake_play), \
                 mock.patch.object(audio.sd, "wait"), \
+                mock.patch.object(daemon, "wait_for_idle", side_effect=typing_wait or (lambda stop=None, **kw: True)), \
                 mock.patch.object(audio, "supports_stereo_output", return_value=True):
             t = threading.Thread(
                 target=daemon.serve,
@@ -387,6 +421,115 @@ class DaemonHttpTest(unittest.TestCase):
             term.assert_called_once()
             init.assert_called_once()
 
+    def test_typing_holds_queue_then_plays_in_order(self):
+        waiting = threading.Event()
+        quiet = threading.Event()
+
+        def typing_wait(stop, *, since=None):
+            waiting.set()
+            while not quiet.wait(0.01):
+                if stop():
+                    return False
+            return not stop()
+
+        with self.running_daemon(typing_wait=typing_wait) as (port, _token, played, played_event):
+            for notes in ("0,0.8,50", "0,0.8,50 4,0.8,50"):
+                st, _ = self._http("POST", port, "/api/play", {"notes": notes, "use_mic": False})
+                self.assertEqual(st, 200)
+            self.assertTrue(waiting.wait(2.0))
+            self.assertEqual(played, [])
+            quiet.set()
+            deadline = time.monotonic() + 2.0
+            while len(played) < 2 and time.monotonic() < deadline:
+                played_event.wait(0.01)
+                played_event.clear()
+            self.assertEqual(len(played), 2)
+            self.assertLess(len(played[0]), len(played[1]))
+
+    def test_pending_sound_uses_volume_changes_including_auto(self):
+        for override, expected in ((0.0, 0.0), (0.65, 0.65), (None, 0.8)):
+            with self.subTest(override=override):
+                waiting = threading.Event()
+                quiet = threading.Event()
+
+                def typing_wait(stop, *, since=None):
+                    waiting.set()
+                    while not quiet.wait(0.01):
+                        if stop():
+                            return False
+                    return not stop()
+
+                with mock.patch.object(audio.MicRing, "resolve_for_args", return_value=(440, 0.25, "sine")), \
+                        mock.patch.object(audio.MicRing, "recent_gain", return_value=0.8) as auto_gain, \
+                        self.running_daemon(typing_wait=typing_wait) as (port, token, played, played_event):
+                    auth = {"X-Conso-Token": token}
+                    self._http("POST", port, "/api/controls", {"gain_override": 0.9}, auth)
+                    self._http("POST", port, "/api/play", {"melody": "done", "use_mic": True})
+                    self.assertTrue(waiting.wait(2.0))
+                    auto_gain.assert_not_called()
+                    st, _ = self._http("POST", port, "/api/controls", {"gain_override": override}, auth)
+                    self.assertEqual(st, 200)
+                    quiet.set()
+                    self.assertTrue(played_event.wait(2.0))
+                    self.assertAlmostEqual(float(np.max(np.abs(played[0]))), expected, places=4)
+                    self.assertEqual(auto_gain.call_count, int(override is None))
+
+    def test_pending_sound_prevents_idle_exit_and_restarts_timer(self):
+        waiting = threading.Event()
+        quiet = threading.Event()
+        ages = []
+
+        def typing_wait(stop, *, since=None):
+            ages.append(since)
+            waiting.set()
+            while not quiet.wait(0.01):
+                if stop():
+                    return False
+            return not stop()
+
+        with mock.patch.object(daemon, "DAEMON_IDLE_S", 0.5), \
+                self.running_daemon(typing_wait=typing_wait) as (port, _token, played, played_event):
+            self._http("POST", port, "/api/play", {"melody": "done", "use_mic": False})
+            self.assertTrue(waiting.wait(2.0))
+            time.sleep(0.7)
+            self.assertTrue(self.daemon_thread.is_alive())
+            self.assertEqual(played, [])
+            self.assertIsNotNone(ages[0])
+            _, body = self._http("GET", port, "/api/status")
+            self.assertEqual(json.loads(body)["controls"]["idle_remaining_s"], 0.5)
+            quiet.set()
+            self.assertTrue(played_event.wait(2.0))
+            self.assertTrue(self.daemon_thread.is_alive())
+            self.daemon_thread.join(timeout=2.0)
+            self.assertFalse(self.daemon_thread.is_alive())
+
+    def test_mute_and_shutdown_while_waiting_for_typing(self):
+        for mute in (False, True):
+            with self.subTest(mute=mute):
+                waiting = threading.Event()
+                quiet = threading.Event()
+                finished = threading.Event()
+
+                def typing_wait(stop, *, since=None):
+                    waiting.set()
+                    while not quiet.wait(0.01):
+                        if stop():
+                            return False
+                    return not stop()
+
+                with mock.patch.object(audio.MicRing, "unmute_playback", side_effect=finished.set), \
+                        self.running_daemon(typing_wait=typing_wait) as (port, token, played, _ev):
+                    self._http("POST", port, "/api/play", {"melody": "done", "use_mic": False})
+                    self.assertTrue(waiting.wait(2.0))
+                    if mute:
+                        self._http("POST", port, "/api/controls", {"muted": True}, {"X-Conso-Token": token})
+                        self.assertTrue(finished.wait(2.0))
+                        self.assertEqual(played, [])
+                    self._http("POST", port, "/api/stop", {}, {"X-Conso-Token": token})
+                    self.daemon_thread.join(timeout=2.0)
+                    self.assertFalse(self.daemon_thread.is_alive())
+                    self.assertEqual(played, [])
+
     def test_bind_failure_plays_in_process(self):
         parser = beep.build_arg_parser()
         args = parser.parse_args(["--listen", "--root", "440", "--", "0,0.8,50"])
@@ -400,6 +543,7 @@ class DaemonHttpTest(unittest.TestCase):
         play.assert_called_once()
         self.assertEqual(play.call_args.args[2], args.notes)
         self.assertEqual(play.call_args.args[3:6], (0.25, 0.0, 0))
+        self.assertIs(play.call_args.kwargs["before_play"], daemon.wait_for_idle)
 
     def test_security(self):
         with self.running_daemon() as (port, token, _played, _played_event):
@@ -427,6 +571,14 @@ class DaemonHttpTest(unittest.TestCase):
 
 
 class DispatchPlayTest(unittest.TestCase):
+    def test_sync_uses_typing_gate(self):
+        args = beep.build_arg_parser().parse_args(["--sync", "--root", "440", "--", "0,0.8,50"])
+        with mock.patch("typing_idle.wait_for_idle") as wait, \
+                mock.patch.object(audio, "resolve_mic", return_value=(440, 0.25, "sine")), \
+                mock.patch.object(audio, "play_notes") as play:
+            beep.dispatch_play(args, (0, 0, 0), args.notes)
+        self.assertIs(play.call_args.kwargs["before_play"], wait)
+
     def test_fallback_spawns_listener_when_daemon_unavailable(self):
         args = beep.build_arg_parser().parse_args(["--root", "440", "--", "0,0.8,50"])
         placement = (0.5, 0.0, 0)

@@ -17,6 +17,7 @@ pip install sounddevice numpy
 - `daemon.py` — localhost HTTP server (`http://127.0.0.1:47392`), and playback worker.
 - `dashboard.html` — live room status, quick controls, and a play panel with tone, pan, muffle, and ticks.
 - `spatial.py` — Windows monitor panning and virtual-desktop muffling/ticks.
+- `typing_idle.py` — Windows input-pause wait before playback.
 - `tests/` — `unittest` suite (`python -m unittest discover -s tests -v`).
 
 ## How it works
@@ -25,6 +26,7 @@ pip install sounddevice numpy
 - `--melody NAME` plays a built-in tone (`done`, `fail`, `tool-fail`, `permission`, `question`, `idle`, `auth`, `alert`).
 - `--mic` matches pitch (or avoids speech in `450-900 Hz`) and scales volume to room loudness. After the first mic-mode request, the daemon keeps the microphone open until it exits (indefinitely with `Keep Alive` on).
 - On Windows, the beep pans toward the active window's monitor. Beeps from other virtual desktops sound muffled, with one tick per desktop away.
+- On Windows, playback waits for a pause in keyboard and mouse input. The longer a sound waits, the shorter the pause it needs.
 
 ## CLI
 

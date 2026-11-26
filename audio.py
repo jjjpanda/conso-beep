@@ -354,7 +354,9 @@ def resolve_mic(args, source=record_audio, gain_override=None, timbre_override=N
     return root_hz, gain, timbre
 
 
-def play_notes(root_hz, gain, notes, pan=0.0, muffle=0.0, ticks=0, wait=True, timbre=DEFAULT_TIMBRE):
+def play_notes(root_hz, gain, notes, pan=0.0, muffle=0.0, ticks=0, wait=True, timbre=DEFAULT_TIMBRE,
+               before_play=None, get_gain=None):
+    """Render a phrase, then check permission and resolve its gain before output."""
     audio = render_phrase(root_hz, notes, timbre=timbre)
     if audio is None:
         return
@@ -369,15 +371,20 @@ def play_notes(root_hz, gain, notes, pan=0.0, muffle=0.0, ticks=0, wait=True, ti
         audio = np.concatenate([np.column_stack((click, click)), audio])
     if supports_stereo_output():
         gl, gr = pan_gains(pan)
-        audio = np.clip(audio * (np.array([gl, gr], dtype=np.float32) * (math.sqrt(2) * gain)), -1.0, 1.0)
+        audio = audio * (np.array([gl, gr], dtype=np.float32) * math.sqrt(2))
     else:
         audio = audio.mean(axis=1)
-        audio = gain * audio / max(np.abs(audio).max(), 1e-9)
+        audio = audio / max(np.abs(audio).max(), 1e-9)
     tail_n = int(SAMPLE_RATE * TAIL_S)
     if audio.ndim == 2:
         audio = np.concatenate([audio, np.zeros((tail_n, audio.shape[1]), dtype=np.float32)])
     else:
         audio = np.concatenate([audio, np.zeros(tail_n, dtype=np.float32)])
+    if before_play is not None and not before_play():
+        return
+    if get_gain is not None:
+        gain = get_gain()
+    audio = np.clip(audio * gain, -1.0, 1.0)
     sd.play(audio.astype(np.float32), SAMPLE_RATE, latency="low")
     if wait:
         sd.wait()
@@ -471,6 +478,11 @@ class MicRing:
         if self.filled < min_samples:
             return None
         return self._slice_tail(seconds)
+
+    def recent_gain(self, seconds):
+        """Read current ambient gain without waiting for or opening a stream."""
+        buffer = self._slice_tail(seconds)
+        return DEFAULT_GAIN if buffer is None else ambient_level(buffer)[1]
 
     def _analyze_key_state(self, key_buf):
         chroma = compute_chroma(key_buf, SAMPLE_RATE)

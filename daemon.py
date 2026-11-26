@@ -13,6 +13,7 @@ import time
 import sounddevice as sd
 
 import audio
+from typing_idle import wait_for_idle
 
 DAEMON_PORT = 47392
 DAEMON_IDLE_S = 600
@@ -35,10 +36,37 @@ def serve(args, parse_request, resolve_spatial_fn, melodies, port=DAEMON_PORT, r
     token = secrets.token_hex(16)
     controls = {"muted": False, "gain_override": None, "keep_alive": False}
     state_lock = threading.Lock()
-    activity = {"ts": time.monotonic()}
+    activity = {"ts": time.monotonic(), "pending": 0}
     stop_event = threading.Event()
     mic = audio.MicRing()
     play_queue: queue.Queue = queue.Queue()
+
+    def enqueue(request):
+        with state_lock:
+            request.queued_at = time.monotonic()
+            activity["ts"] = request.queued_at
+            activity["pending"] += 1
+            play_queue.put(request)
+
+    def cancelled():
+        with state_lock:
+            return stop_event.is_set() or controls["muted"]
+
+    def ready_to_play(request):
+        if not wait_for_idle(cancelled, since=request.queued_at):
+            return False
+        mic.mute_playback()
+        return True
+
+    def current_gain(request):
+        with state_lock:
+            override = controls["gain_override"]
+        if override is not None:
+            return override
+        seconds = next((s for s in (request.auto_key, request.avoid_speech, request.mic) if s is not None), None)
+        if seconds is not None:
+            return mic.recent_gain(seconds)
+        return audio.DEFAULT_GAIN
 
     def worker_loop():
         while True:
@@ -46,28 +74,33 @@ def serve(args, parse_request, resolve_spatial_fn, melodies, port=DAEMON_PORT, r
             if request is None:
                 break
             try:
+                if stop_event.is_set():
+                    break
                 with state_lock:
                     if controls["muted"]:
                         continue
-                    gain_override = controls["gain_override"]
                 root_hz, gain, timbre = mic.resolve_for_args(
                     request,
-                    gain_override=gain_override,
                     timbre_override=getattr(request, "timbre_override", None),
                 )
                 placement = resolve_spatial_fn(request)
-                mic.mute_playback()
                 try:
-                    audio.play_notes(root_hz, gain, request.notes, *placement, wait=True, timbre=timbre)
+                    audio.play_notes(root_hz, gain, request.notes, *placement, wait=True, timbre=timbre,
+                                     before_play=lambda: ready_to_play(request), get_gain=lambda: current_gain(request))
                 except sd.PortAudioError:
                     mic.close()
                     sd._terminate()
                     sd._initialize()
-                    audio.play_notes(root_hz, gain, request.notes, *placement, wait=True, timbre=timbre)
+                    audio.play_notes(root_hz, gain, request.notes, *placement, wait=True, timbre=timbre,
+                                     before_play=lambda: ready_to_play(request), get_gain=lambda: current_gain(request))
                 finally:
                     mic.unmute_playback()
             except Exception as e:
                 print(f"[beep] daemon playback error: {e!r}", file=sys.stderr)
+            finally:
+                with state_lock:
+                    activity["pending"] -= 1
+                    activity["ts"] = time.monotonic()
 
     class Handler(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -141,6 +174,8 @@ def serve(args, parse_request, resolve_spatial_fn, melodies, port=DAEMON_PORT, r
                     ctrl = dict(controls)
                     if ctrl["keep_alive"]:
                         idle_remaining = None
+                    elif activity["pending"]:
+                        idle_remaining = DAEMON_IDLE_S
                     else:
                         idle_remaining = max(0, round(DAEMON_IDLE_S - (time.monotonic() - activity["ts"])))
                     ctrl["idle_remaining_s"] = idle_remaining
@@ -224,7 +259,7 @@ def serve(args, parse_request, resolve_spatial_fn, melodies, port=DAEMON_PORT, r
                     activity["ts"] = time.monotonic()
                     muted = controls["muted"]
                 if request.notes and not muted:
-                    play_queue.put(request)
+                    enqueue(request)
                 self._send_json(200, {"ok": True, "muted": muted})
                 return
 
@@ -268,7 +303,8 @@ def serve(args, parse_request, resolve_spatial_fn, melodies, port=DAEMON_PORT, r
     except OSError:
         if args.notes:
             root_hz, gain, timbre = audio.resolve_mic(args)
-            audio.play_notes(root_hz, gain, args.notes, *resolve_spatial_fn(args), timbre=timbre)
+            audio.play_notes(root_hz, gain, args.notes, *resolve_spatial_fn(args), timbre=timbre,
+                             before_play=wait_for_idle)
         return 0
 
     server.timeout = 0.5
@@ -282,17 +318,19 @@ def serve(args, parse_request, resolve_spatial_fn, melodies, port=DAEMON_PORT, r
 
     try:
         if args.notes:
-            play_queue.put(args)
+            enqueue(args)
         while not stop_event.is_set():
             server.handle_request()
             with state_lock:
                 idle_expired = (
                     not controls["keep_alive"]
+                    and activity["pending"] == 0
                     and (time.monotonic() - activity["ts"]) >= DAEMON_IDLE_S
                 )
             if idle_expired:
                 break
     finally:
+        stop_event.set()
         server.server_close()
         play_queue.put(None)
         worker.join(timeout=5.0)

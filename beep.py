@@ -21,6 +21,7 @@
   --listen       run the HTTP dashboard & rolling-buffer mic daemon on http://127.0.0.1:47392
 
 Mic recording is capped at 30 seconds. Without a mic mode, volume is 0.25.
+On Windows, playback waits for a pause in keyboard and mouse input.
 
 Note: positional notes must follow a `--` separator (negative offsets look like
 flags to argparse otherwise), e.g. beep.py --root 440 -- -3,0.7,90
@@ -254,9 +255,10 @@ def spawn_detached(beep_args: list[str]) -> None:
 def dispatch_play(args, placement, notes, port=DAEMON_PORT):
     if args.sync:
         import audio
+        from typing_idle import wait_for_idle
 
         root_hz, gain, timbre = audio.resolve_mic(args)
-        audio.play_notes(root_hz, gain, notes, *placement, timbre=timbre)
+        audio.play_notes(root_hz, gain, notes, *placement, timbre=timbre, before_play=wait_for_idle)
         return
     argv = play_argv(args, placement, notes)
     if not send_to_daemon(argv, port=port):
