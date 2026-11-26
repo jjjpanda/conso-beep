@@ -17,8 +17,6 @@ import audio
 DAEMON_PORT = 47392
 DAEMON_IDLE_S = 600
 DAEMON_MAX_MSG_BYTES = 65536
-DEFAULT_ASK_TIMEOUT_S = 120.0
-MAX_ASK_TIMEOUT_S = 600.0
 DASHBOARD_HTML = pathlib.Path(__file__).with_name("dashboard.html")
 
 
@@ -33,44 +31,14 @@ class _DaemonHTTPServer(http.server.ThreadingHTTPServer):
 
 
 def serve(args, parse_request, resolve_spatial_fn, melodies, port=DAEMON_PORT, ready_event=None, bound_port_out=None):
-    """Run the localhost HTTP dashboard, permission inbox, and playback daemon."""
+    """Run the localhost HTTP dashboard and playback daemon."""
     token = secrets.token_hex(16)
     controls = {"muted": False, "gain_override": None, "keep_alive": False}
-    permissions: dict[str, dict] = {}
-    alerts: dict[str, dict] = {}
     state_lock = threading.Lock()
     activity = {"ts": time.monotonic()}
     stop_event = threading.Event()
     mic = audio.MicRing()
     play_queue: queue.Queue = queue.Queue()
-
-    def wake_all_permissions():
-        with state_lock:
-            for entry in permissions.values():
-                if entry["decision"] is None:
-                    entry["decision"] = "timeout"
-                    entry["reason"] = "daemon stopped"
-                entry["event"].set()
-
-    def public_fields(entry):
-        return {k: entry[k] for k in ("id", "title", "detail", "cwd", "source", "created_at")}
-
-    def queue_melody(body, default):
-        melody_name = body.get("melody", default)
-        if not isinstance(melody_name, str) or melody_name not in melodies:
-            return
-        try:
-            root_flags = body.get("root_flags") or []
-            if isinstance(root_flags, list) and all(isinstance(x, str) for x in root_flags):
-                pan = float(body.get("pan", 0.0))
-                muffle = float(body.get("muffle", 0.0))
-                ticks = int(body.get("ticks", 0))
-                argv = [*root_flags, f"--pan={pan:.4f}", f"--muffle={muffle:.4f}", f"--ticks={ticks}", "--", *melodies[melody_name]]
-                req = parse_request(argv)
-                if req.notes:
-                    play_queue.put(req)
-        except (Exception, SystemExit):
-            pass
 
     def worker_loop():
         while True:
@@ -171,20 +139,16 @@ def serve(args, parse_request, resolve_spatial_fn, melodies, port=DAEMON_PORT, r
                 mic_status = mic.snapshot_status()
                 with state_lock:
                     ctrl = dict(controls)
-                    if ctrl["keep_alive"] or permissions:
+                    if ctrl["keep_alive"]:
                         idle_remaining = None
                     else:
                         idle_remaining = max(0, round(DAEMON_IDLE_S - (time.monotonic() - activity["ts"])))
                     ctrl["idle_remaining_s"] = idle_remaining
-                    perms = [public_fields(e) for e in permissions.values()]
-                    alert_list = [public_fields(e) for e in alerts.values()]
                 self._send_json(
                     200,
                     {
                         "mic": mic_status,
                         "controls": ctrl,
-                        "permissions": perms,
-                        "alerts": alert_list,
                         "melodies": list(melodies.keys()),
                         "melody_notes": {k: " ".join(v) for k, v in melodies.items()},
                     },
@@ -198,7 +162,7 @@ def serve(args, parse_request, resolve_spatial_fn, melodies, port=DAEMON_PORT, r
                 return
             path = self.path.split("?", 1)[0]
 
-            if path in ("/api/permissions/decide", "/api/alerts/dismiss", "/api/controls", "/api/stop") and not self._valid_token():
+            if path in ("/api/controls", "/api/stop") and not self._valid_token():
                 self._send_json(403, {"error": "invalid token"})
                 return
 
@@ -264,98 +228,6 @@ def serve(args, parse_request, resolve_spatial_fn, melodies, port=DAEMON_PORT, r
                 self._send_json(200, {"ok": True, "muted": muted})
                 return
 
-            if path in ("/api/permissions", "/api/alerts"):
-                if not isinstance(body, dict):
-                    self._send_json(400, {"error": "expected JSON object"})
-                    return
-                title = body.get("title")
-                if not isinstance(title, str) or not title.strip():
-                    self._send_json(400, {"error": "title is required"})
-                    return
-                detail = body.get("detail", "")
-                cwd = body.get("cwd", "")
-                source = body.get("source", "")
-                if not all(isinstance(v, str) for v in (detail, cwd, source)):
-                    self._send_json(400, {"error": "detail, cwd, and source must be strings"})
-                    return
-                entry = {
-                    "id": secrets.token_hex(8),
-                    "title": title.strip(),
-                    "detail": detail,
-                    "cwd": cwd,
-                    "source": source,
-                    "created_at": time.time(),
-                }
-
-                if path == "/api/alerts":
-                    with state_lock:
-                        alerts[entry["id"]] = entry
-                        activity["ts"] = time.monotonic()
-                        muted = controls["muted"]
-                    if not muted:
-                        queue_melody(body, "alert")
-                    self._send_json(200, {"ok": True, "id": entry["id"]})
-                    return
-
-                timeout = body.get("timeout", DEFAULT_ASK_TIMEOUT_S)
-                if not isinstance(timeout, (int, float)) or isinstance(timeout, bool) or not math.isfinite(timeout) or timeout <= 0 or timeout > MAX_ASK_TIMEOUT_S:
-                    self._send_json(400, {"error": "invalid timeout"})
-                    return
-                entry.update(event=threading.Event(), decision=None, reason="")
-                with state_lock:
-                    permissions[entry["id"]] = entry
-                    activity["ts"] = time.monotonic()
-                    muted = controls["muted"]
-                if not muted:
-                    queue_melody(body, "permission")
-
-                try:
-                    entry["event"].wait(timeout=float(timeout))
-                finally:
-                    with state_lock:
-                        permissions.pop(entry["id"], None)
-                        activity["ts"] = time.monotonic()
-
-                self._send_json(200, {"decision": entry["decision"] or "timeout", "reason": entry["reason"]})
-                return
-
-            if path == "/api/permissions/decide":
-                if not isinstance(body, dict):
-                    self._send_json(400, {"error": "expected JSON object"})
-                    return
-                ids = body.get("ids")
-                decision = body.get("decision")
-                reason = body.get("reason", "")
-                if not isinstance(ids, list) or not all(isinstance(x, str) for x in ids):
-                    self._send_json(400, {"error": "ids must be a list of strings"})
-                    return
-                if decision not in ("allow", "deny") or not isinstance(reason, str):
-                    self._send_json(400, {"error": "invalid decision or reason"})
-                    return
-                decided = []
-                with state_lock:
-                    activity["ts"] = time.monotonic()
-                    for pid in ids:
-                        entry = permissions.get(pid)
-                        if entry is not None and entry["decision"] is None:
-                            entry["decision"] = decision
-                            entry["reason"] = reason
-                            entry["event"].set()
-                            decided.append(pid)
-                self._send_json(200, {"decided": decided})
-                return
-
-            if path == "/api/alerts/dismiss":
-                ids = body.get("ids") if isinstance(body, dict) else None
-                if not isinstance(ids, list) or not all(isinstance(x, str) for x in ids):
-                    self._send_json(400, {"error": "ids must be a list of strings"})
-                    return
-                with state_lock:
-                    activity["ts"] = time.monotonic()
-                    dismissed = [aid for aid in ids if alerts.pop(aid, None) is not None]
-                self._send_json(200, {"dismissed": dismissed})
-                return
-
             if path == "/api/controls":
                 if not isinstance(body, dict):
                     self._send_json(400, {"error": "expected JSON object"})
@@ -386,7 +258,6 @@ def serve(args, parse_request, resolve_spatial_fn, melodies, port=DAEMON_PORT, r
 
             if path == "/api/stop":
                 stop_event.set()
-                wake_all_permissions()
                 self._send_json(200, {"ok": True})
                 return
 
@@ -417,13 +288,11 @@ def serve(args, parse_request, resolve_spatial_fn, melodies, port=DAEMON_PORT, r
             with state_lock:
                 idle_expired = (
                     not controls["keep_alive"]
-                    and not permissions
                     and (time.monotonic() - activity["ts"]) >= DAEMON_IDLE_S
                 )
             if idle_expired:
                 break
     finally:
-        wake_all_permissions()
         server.server_close()
         play_queue.put(None)
         worker.join(timeout=5.0)

@@ -93,32 +93,7 @@
     label.check { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); cursor: pointer; }
     .play-status { font-size: 12px; color: var(--muted); min-height: 16px; }
     .play-status.bad { color: var(--bad); }
-    .inbox-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
-    .perm-list { display: grid; gap: 10px; }
-    .perm-item {
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      padding: 12px;
-      background: #14171c;
-      display: grid;
-      gap: 8px;
-    }
-    .perm-top { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
-    .perm-title { font-weight: 600; font-size: 14px; }
-    .perm-meta { font-size: 12px; color: var(--muted); font-family: ui-monospace, Consolas, monospace; word-break: break-all; }
-    pre.perm-detail {
-      margin: 0;
-      padding: 8px 10px;
-      border-radius: 6px;
-      background: #0d0f13;
-      border: 1px solid #222731;
-      font-size: 12px;
-      white-space: pre-wrap;
-      word-break: break-word;
-      max-height: 180px;
-      overflow: auto;
-    }
-    .empty { color: var(--muted); font-size: 13px; padding: 12px 0; }
+    .card-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
     .banner {
       display: none;
       padding: 10px 14px;
@@ -138,31 +113,6 @@
     </header>
 
     <div id="offlineBanner" class="banner">Daemon disconnected.</div>
-
-    <section class="card">
-      <div class="inbox-head">
-        <div class="row">
-          <h2 style="margin:0;">Pending Permissions</h2>
-          <span id="permCount" class="badge">0</span>
-        </div>
-        <div class="row">
-          <button id="allowAllBtn" class="primary" type="button" disabled>Allow All</button>
-          <button id="denyAllBtn" class="danger" type="button" disabled>Deny All</button>
-        </div>
-      </div>
-      <div id="permList" class="perm-list"></div>
-    </section>
-
-    <section id="alertCard" class="card" style="display:none;">
-      <div class="inbox-head">
-        <div class="row">
-          <h2 style="margin:0;">Alerts</h2>
-          <span id="alertCount" class="badge warn">0</span>
-        </div>
-        <button id="dismissAllBtn" type="button">Dismiss All</button>
-      </div>
-      <div id="alertList" class="perm-list"></div>
-    </section>
 
     <div class="top-grid">
       <section class="card">
@@ -209,7 +159,7 @@
     </div>
 
     <section class="card">
-      <div class="inbox-head" style="margin-bottom:10px;">
+      <div class="card-head" style="margin-bottom:10px;">
         <h2 style="margin:0;">Play</h2>
         <div class="row">
           <select id="timbreSelect">
@@ -244,8 +194,6 @@
 
   <script>
     const TOKEN = "{{TOKEN}}";
-    let currentIds = [];
-    let currentAlertIds = [];
     let currentControls = { muted: false, keep_alive: false, gain_override: null };
     let renderedMelodies = "";
     let melodyNotes = {};
@@ -343,94 +291,10 @@
       const idle = document.getElementById("idleReadout");
       if (ctrl.keep_alive) {
         idle.textContent = "Pinned";
-      } else if (ctrl.idle_remaining_s == null) {
-        idle.textContent = "Paused (pending)";
       } else {
         const m = Math.floor(ctrl.idle_remaining_s / 60);
         const s = ctrl.idle_remaining_s % 60;
         idle.textContent = m + "m " + String(s).padStart(2, "0") + "s";
-      }
-    }
-
-    function renderPermissions(perms) {
-      currentIds = perms.map((p) => p.id);
-      const countBadge = document.getElementById("permCount");
-      countBadge.textContent = String(perms.length);
-      countBadge.className = perms.length ? "badge warn" : "badge";
-      document.getElementById("allowAllBtn").disabled = perms.length === 0;
-      document.getElementById("denyAllBtn").disabled = perms.length === 0;
-
-      const list = document.getElementById("permList");
-      list.textContent = "";
-      if (perms.length === 0) {
-        const empty = document.createElement("div");
-        empty.className = "empty";
-        empty.textContent = "No pending permission requests.";
-        list.appendChild(empty);
-        return;
-      }
-
-      for (const p of perms) {
-        list.appendChild(inboxItem(p, [
-          ["Allow", "primary", () => postJson("/api/permissions/decide", { ids: [p.id], decision: "allow" })],
-          ["Deny", "danger", () => postJson("/api/permissions/decide", { ids: [p.id], decision: "deny" })]
-        ]));
-      }
-    }
-
-    function inboxItem(p, buttons) {
-      const item = document.createElement("div");
-      item.className = "perm-item";
-
-      const top = document.createElement("div");
-      top.className = "perm-top";
-
-      const title = document.createElement("div");
-      title.className = "perm-title";
-      title.textContent = p.title;
-      top.appendChild(title);
-
-      const actions = document.createElement("div");
-      actions.className = "row";
-      for (const [label, cls, action] of buttons) {
-        const btn = document.createElement("button");
-        btn.type = "button";
-        btn.className = cls;
-        btn.textContent = label;
-        btn.onclick = async () => {
-          await action();
-          refresh();
-        };
-        actions.appendChild(btn);
-      }
-      top.appendChild(actions);
-      item.appendChild(top);
-
-      const age = Math.max(0, Math.round(Date.now() / 1000 - p.created_at));
-      const metaParts = [p.source || "cli", age + "s ago"];
-      if (p.cwd) metaParts.push(p.cwd);
-      const meta = document.createElement("div");
-      meta.className = "perm-meta";
-      meta.textContent = metaParts.join(" · ");
-      item.appendChild(meta);
-
-      if (p.detail) {
-        const pre = document.createElement("pre");
-        pre.className = "perm-detail";
-        pre.textContent = p.detail;
-        item.appendChild(pre);
-      }
-      return item;
-    }
-
-    function renderAlerts(alerts) {
-      currentAlertIds = alerts.map((a) => a.id);
-      document.getElementById("alertCard").style.display = alerts.length ? "" : "none";
-      document.getElementById("alertCount").textContent = String(alerts.length);
-      const list = document.getElementById("alertList");
-      list.textContent = "";
-      for (const a of alerts) {
-        list.appendChild(inboxItem(a, [["Dismiss", "", () => postJson("/api/alerts/dismiss", { ids: [a.id] })]]));
       }
     }
 
@@ -447,8 +311,6 @@
         renderMelodies(data.melodies, data.melody_notes);
         renderMic(data.mic);
         renderControls(data.controls);
-        renderPermissions(data.permissions);
-        renderAlerts(data.alerts || []);
       } catch (_err) {
         conn.textContent = "Disconnected";
         conn.className = "badge bad";
@@ -484,25 +346,6 @@
     document.getElementById("stopBtn").onclick = async () => {
       await postJson("/api/stop", {});
       refresh();
-    };
-    document.getElementById("allowAllBtn").onclick = async () => {
-      if (currentIds.length) {
-        await postJson("/api/permissions/decide", { ids: currentIds, decision: "allow" });
-        refresh();
-      }
-    };
-    document.getElementById("denyAllBtn").onclick = async () => {
-      if (currentIds.length) {
-        await postJson("/api/permissions/decide", { ids: currentIds, decision: "deny" });
-        refresh();
-      }
-    };
-
-    document.getElementById("dismissAllBtn").onclick = async () => {
-      if (currentAlertIds.length) {
-        await postJson("/api/alerts/dismiss", { ids: currentAlertIds });
-        refresh();
-      }
     };
 
     refresh();
